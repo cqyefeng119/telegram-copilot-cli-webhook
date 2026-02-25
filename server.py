@@ -7,7 +7,7 @@ import shutil
 from collections import deque
 from pathlib import Path
 
-# 优先从同目录下的 .env 文件加载环境变量
+# Prefer loading environment variables from the .env file in the same directory
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
