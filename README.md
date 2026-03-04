@@ -38,7 +38,7 @@ This is not "wire AI into everything" — it establishes an **auditable trust pa
 
 ## The Problem It Solves
 
-Most AI agents cannot touch real data for one reason: **uncontrollable risk**.
+Most AI agents are deployed in sandboxes and are not allowed to access personal data for one reason: **uncontrollable risk**.
 
 Once connected to:
 
