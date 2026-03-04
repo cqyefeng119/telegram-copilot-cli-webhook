@@ -19,7 +19,8 @@ Get-Content ".env" | ForEach-Object {
         [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2].Trim())
     }
 }
-$BOT_TOKEN = [System.Environment]::GetEnvironmentVariable("BOT_TOKEN")
+$BOT_TOKEN  = [System.Environment]::GetEnvironmentVariable("BOT_TOKEN")
+$PUBLIC_URL = [System.Environment]::GetEnvironmentVariable("PUBLIC_URL")
 
 # Ensure uv command is resolvable in this shell session
 $uvPath = Join-Path $env:USERPROFILE ".local\bin"
@@ -44,50 +45,55 @@ $uvProcess = Start-Process -NoNewWindow -FilePath "uv" `
     -PassThru
 Start-Sleep -Seconds 2
 
-# ── Step 2: Start Cloudflare Tunnel ───────────────────────────────────────────
-# cloudflared installed via winget lands in a non-standard path; add it to PATH if needed
-$cfWinget = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter "cloudflared.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($cfWinget -and $env:Path -notlike "*$($cfWinget.DirectoryName)*") {
-    $env:Path = "$($cfWinget.DirectoryName);$env:Path"
-}
+# ── Step 2: Cloudflare Tunnel / PUBLIC_URL ────────────────────────────────────
+if ($PUBLIC_URL) {
+    Write-Host "[2/3] Using permanent PUBLIC_URL: $PUBLIC_URL" -ForegroundColor Cyan
+    $publicUrl = $PUBLIC_URL.TrimEnd("/")
+} else {
+    # cloudflared installed via winget lands in a non-standard path; add it to PATH if needed
+    $cfWinget = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter "cloudflared.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cfWinget -and $env:Path -notlike "*$($cfWinget.DirectoryName)*") {
+        $env:Path = "$($cfWinget.DirectoryName);$env:Path"
+    }
 
-if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-    Write-Host "[warn] cloudflared not found — skipping tunnel and webhook registration." -ForegroundColor Yellow
-    Write-Host "       Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/" -ForegroundColor DarkYellow
-    Write-Host "[ready] Server running at http://localhost:8000  (register webhook manually)" -ForegroundColor Green
-    Wait-Process -Id $uvProcess.Id
-    exit 0
-}
+    if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
+        Write-Host "[warn] cloudflared not found — skipping tunnel and webhook registration." -ForegroundColor Yellow
+        Write-Host "       Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/" -ForegroundColor DarkYellow
+        Write-Host "[ready] Server running at http://localhost:8000  (register webhook manually)" -ForegroundColor Green
+        Wait-Process -Id $uvProcess.Id
+        exit 0
+    }
 
-$cfLog = Join-Path $PSScriptRoot "cf-tunnel.log"
-$cfLogOut = Join-Path $PSScriptRoot "cf-tunnel-out.log"
-Remove-Item $cfLog,$cfLogOut -ErrorAction SilentlyContinue
-Write-Host "[2/3] Starting Cloudflare Tunnel ..." -ForegroundColor Cyan
-$cfProcess = Start-Process -NoNewWindow -FilePath "cloudflared" `
-    -ArgumentList "tunnel","--url","http://localhost:8000" `
-    -RedirectStandardOutput $cfLogOut -RedirectStandardError $cfLog -PassThru
+    $cfLog = Join-Path $PSScriptRoot "cf-tunnel.log"
+    $cfLogOut = Join-Path $PSScriptRoot "cf-tunnel-out.log"
+    Remove-Item $cfLog,$cfLogOut -ErrorAction SilentlyContinue
+    Write-Host "[2/3] Starting Cloudflare Tunnel ..." -ForegroundColor Cyan
+    $cfProcess = Start-Process -NoNewWindow -FilePath "cloudflared" `
+        -ArgumentList "tunnel","--url","http://localhost:8000" `
+        -RedirectStandardOutput $cfLogOut -RedirectStandardError $cfLog -PassThru
 
-# Wait up to 30 s for the tunnel URL to appear in the log (cloudflared writes URL to stderr)
-$publicUrl = $null
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 1
-    foreach ($logFile in @($cfLog, $cfLogOut)) {
-        if (Test-Path $logFile) {
-            $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-            if ($content -match 'https://[a-z0-9\-]+\.trycloudflare\.com') {
-                $publicUrl = $Matches[0]; break
+    # Wait up to 30 s for the tunnel URL to appear in the log (cloudflared writes URL to stderr)
+    $publicUrl = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        foreach ($logFile in @($cfLog, $cfLogOut)) {
+            if (Test-Path $logFile) {
+                $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                if ($content -match 'https://[a-z0-9\-]+\.trycloudflare\.com') {
+                    $publicUrl = $Matches[0]; break
+                }
             }
         }
+        if ($publicUrl) { break }
     }
-    if ($publicUrl) { break }
+    if (-not $publicUrl) {
+        Write-Host "[error] Could not detect Cloudflare Tunnel URL after 30 s. Check cf-tunnel.log." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[info]  Tunnel URL: $publicUrl" -ForegroundColor Green
+    Write-Host "[info]  Waiting 5 s for DNS propagation ..." -ForegroundColor DarkCyan
+    Start-Sleep -Seconds 5
 }
-if (-not $publicUrl) {
-    Write-Host "[error] Could not detect Cloudflare Tunnel URL after 30 s. Check cf-tunnel.log." -ForegroundColor Red
-    exit 1
-}
-Write-Host "[info]  Tunnel URL: $publicUrl" -ForegroundColor Green
-Write-Host "[info]  Waiting 5 s for DNS propagation ..." -ForegroundColor DarkCyan
-Start-Sleep -Seconds 5
 
 # ── Step 3: Register Telegram webhook ─────────────────────────────────────────
 Write-Host "[3/3] Registering Telegram webhook ..." -ForegroundColor Cyan
@@ -116,5 +122,9 @@ if (-not $registered) {
 
 Write-Host ""
 Write-Host "[ready] All services running. Press Ctrl+C to stop." -ForegroundColor Green
-# Keep script alive; exit when cloudflared exits
-Wait-Process -Id $cfProcess.Id
+# Keep script alive; wait for uvicorn (always running), or cloudflared if using quick-tunnel
+if ($PUBLIC_URL) {
+    Wait-Process -Id $uvProcess.Id
+} else {
+    Wait-Process -Id $cfProcess.Id
+}

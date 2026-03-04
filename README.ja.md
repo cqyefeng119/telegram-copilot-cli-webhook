@@ -1,47 +1,130 @@
 # Telegram Webhook（Copilot CLI）
 
-この FastAPI サービスは Telegram メッセージを受信し、GitHub Copilot CLI の結果を Telegram に返信します。
+---
+
+## 概要
+
+このプロジェクトは：
+
+* **高透明性** — すべての操作が可視化される
+* **高制御性** — 何を許可するかはあなたが決める
+* **低複雑性** — ローカル単一エージェント
+* **拡張可能** — 再設計せずにスケール可能
+
+AI が個人データに安全にアクセスするための**最小信頼基盤**。**最小可制御アーキテクチャ**を提供します：
+
+```
+Telegram（スマホ）
+      ↓
+Cloudflare Tunnel（固定ドメイン / HTTPS）
+      ↓
+localhost:8000（Webhook）
+      ↓
+単一エージェント（Copilot CLI、ローカル実行）
+```
+
+コア原則：
+
+* エージェントは常にローカルで実行される
+* すべての操作が可視化される
+* 権限は段階的に付与される
+* 人間がいつでも制御できる
+
+これは「AI をすべてに接続する」ことではなく、**監査可能な信頼パス**を確立するものです。
+
+![Telegram インタラクションデモ](docs/images/telegram-demo.jpg)
+
+---
+
+## 解決する問題
+
+ほとんどの AI エージェントが実データにアクセスできない理由は 1 つ：**制御不可能なリスク**。
+
+一度接続すると：
+
+* プライベートカレンダー
+* ローカルドキュメント
+* チャットアプリケーション
+* ブラウザ操作
+
+可視性と権限境界がなければ、セキュリティ上の危険が生じます。
+
+このアーキテクチャが提供するもの：
+
+* ローカル実行
+* Telegram を可視化制御コンソールとして
+* Tunnel を安全なエントリポイントとして
+
+「リモートコマンド、ローカル実行」を実現します。
+
+---
+
+## 実現可能なユースケース
+
+| シナリオ | 運用方式 |
+| ------ | -------- |
+| 飲食店予約 | エージェントがブラウザ操作 → スクリーンショット送信 → あなたが確認 |
+| ドキュメント整理 | ローカルディレクトリで処理、クラウドには上げない |
+| メッセージ下書き | 下書き生成 → 確認 → 送信許可 |
+| 契約データ入力 | エージェント処理 → あなたが重要項目を確認 |
+
+重点：
+
+> 先に読取権限を付与し、確認後に書込権限を付与する。
+> 先に結果を見て、次に実行を認可する。
+
+---
 
 ## 前提条件
 
-- Windows + PowerShell
-- Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) のインストール
-- GitHub Copilot CLI が利用可能（または `.env` で `COPILOT_COMMAND` を指定）
-- [BotFather](https://t.me/BotFather) で発行した Telegram Bot Token
+* Windows + PowerShell
+* Python 3.11+
+* `uv` のインストール
+* Copilot CLI が利用可能（またはカスタムコマンド）
+* Telegram から取得した Bot Token
+
+---
 
 ## セットアップ
 
-1. `.env.example` を `.env` にコピー
-2. 最低限以下を設定：
-   - `BOT_TOKEN` — BotFather から取得したトークン
-   - `ALLOWED_USER_IDS` — 後の手順で設定するため、今は空白のまま
-3. 依存関係をインストール：
-   ```powershell
-   uv sync
-   ```
+### 1. 環境準備
 
-## 初回起動手順
+```
+.env.example を .env にコピー
+BOT_TOKEN を記入
+実行: uv sync
+```
 
-> **前提：** [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) をインストールして PATH に追加してください。
-> `start.ps1` が下記の手順 2・3 を自動で行います。
+### 2. トンネルモードを選択
 
-### 1. ワンコマンドで起動
+#### オプション A: 固定パブリック URL（推奨）
 
+`.env` に記述：
+```
+PUBLIC_URL=https://your-domain.example.com
+```
+
+その後実行：
 ```powershell
 .\start.ps1
 ```
 
-スクリプトは以下を自動実行します：
-1. `http://0.0.0.0:8000` で uvicorn を起動
-2. Cloudflare Tunnel を起動してパブリック URL を取得
-3. その URL を Telegram Webhook に自動登録
+#### オプション B: Cloudflare Quick Tunnel
 
-`cloudflared` がインストールされていない場合はポート 8000 でサーバーのみ起動し、Webhook は手動で登録してください（下記参照）。
+単に実行：
+```powershell
+.\start.ps1
+```
 
-### 2. Telegram User ID を確認する
+Quick Tunnel は再起動するたびに URL が変わります。本番環境では固定トンネルを使用してください。
 
-サーバー起動後にボットへメッセージを送り、ログを確認します：
+---
+
+## セキュリティ設定
+
+### 1. ユーザーホワイトリスト
+
+サーバー起動後、ボットにメッセージを送信してログを確認：
 
 ```powershell
 Get-Content .\uvicorn.log -Tail 20
@@ -53,16 +136,7 @@ Get-Content .\uvicorn.log -Tail 20
 [telegram] message from user_id=123456789 text='hello'
 ```
 
-生の payload 全体を確認したい場合は、`server.py` の `data = await request.json()` の次の行に `print(data)` を一時的に追記し、サーバーを再起動してメッセージを送ります。ログ内で以下を探してください：
-
-```json
-"from": {
-  "id": 123456789,
-  ...
-}
-```
-
-### 3. `.env` を更新して再起動する
+`.env` に記述して再起動：
 
 ```ini
 ALLOWED_USER_IDS=123456789
@@ -72,20 +146,24 @@ ALLOWED_USER_IDS=123456789
 .\start.ps1
 ```
 
-### 手動 Webhook 登録（cloudflared を使わない場合）
+### 2. 権限制御の思想
 
-```powershell
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" `
-     -d "url=https://<public-domain>/webhook/<BOT_TOKEN>"
-```
+* デフォルト：読取専用
+* 重要なステップ：手動確認が必要
+* 高リスクコマンド：1 つずつ審査
+* プロセスはいつでも停止可能
+
+このモデルは「段階的権限付与」をサポートします。
+
+---
 
 ## Telegram コマンド
 
 | コマンド | 説明 |
-|----------|------|
+| ------ | ---- |
 | `/help` | ヘルプを表示 |
 | `/new` | 新しい Copilot セッションを開始 |
-| `/sessions` | 最近のセッション一覧を表示 |
-| `/use <id>` | 過去のセッションに切り替え |
+| `/sessions` | 最近のセッション一覧 |
+| `/use <id>` | セッションを切り替え |
 
-通常メッセージは現在のセッションに自動で継続されます。
+通常メッセージは現在のセッションに自動で継続します。
