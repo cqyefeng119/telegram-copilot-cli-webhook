@@ -154,6 +154,29 @@ ALLOWED_USER_IDS=123456789
 * 高风险命令逐条审核
 * 可随时停止进程
 
+审批模型（MVP）：
+
+* 默认启用 plan-first（动作计划）。
+* 计划解析失败或置信度不足时，fail-closed 进入审批流程。
+* 网络动作出现新域名/未授权域名时，必须审批。
+* 证据截图可由计划中的 `needs_evidence` 控制（可通过开关回退到关键词判定）。
+* 高风险请求默认拒绝，并发起 Telegram 审批卡片。
+* Inline 按钮：
+      * ✅ 仅本次
+      * 🔁 本对话允许同类
+      * 📁 本项目允许同类
+      * 🤖 本Agent允许同类（仅设置 agent 时显示）
+      * ❌ 拒绝
+* 权限层级：user > agent > project > conversation > 单次。
+* allow 向下继承；deny 仅对当前待审批请求生效。
+
+执行回执格式：
+
+* 所有执行回复统一为两段：
+      * `1,结果...`
+      * `2,过程详细...`
+* 已移除静默模式（不再使用 `--silent`）。
+
 该模型支持“逐步放权”。
 
 
@@ -165,5 +188,16 @@ ALLOWED_USER_IDS=123456789
 | `/new` | 开始新的 Copilot 会话 |
 | `/sessions` | 查看最近会话列表 |
 | `/use <id>` | 切换到历史会话 |
+| `/agent` | 查看当前 agent |
+| `/agent <name>` | 设置当前 agent（执行 Copilot 时透传 `--agent <name>`） |
+| `/agent clear` | 清除当前 agent |
 
 普通消息自动续接当前会话。
+
+---
+
+## 持久化与审计
+
+* `approval_store.json`：保存 grants、pending、用户会话映射、用户 agent 映射。
+* `audit_log.jsonl`：追加写入审批/执行审计事件。
+* 支持处理 `callback_query`，并正确调用 `answerCallbackQuery`。

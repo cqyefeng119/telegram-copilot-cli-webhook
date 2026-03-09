@@ -153,6 +153,29 @@ ALLOWED_USER_IDS=123456789
 * 高リスクコマンド：1 つずつ審査
 * プロセスはいつでも停止可能
 
+承認モデル（MVP）：
+
+* デフォルトで plan-first（アクション計画）が有効です。
+* 計画の解析失敗、または信頼度が低い場合は fail-closed で承認フローに入ります。
+* 新規/未許可ドメインを含むネットワーク操作は必ず承認が必要です。
+* 証拠スクリーンショットは計画内の `needs_evidence` で制御でき、必要に応じてキーワード判定へフォールバックできます。
+* 高リスク要求はデフォルト拒否で、Telegram の承認カードを発行します。
+* Inline ボタン：
+      * ✅ 今回のみ
+      * 🔁 この会話で同種を許可
+      * 📁 このプロジェクトで同種を許可
+      * 🤖 この agent で同種を許可（agent 設定時のみ表示）
+      * ❌ 拒否
+* 権限解決順序：user > agent > project > conversation > one-time。
+* allow は下位へ継承、deny は当該リクエスト 1 回のみ有効です。
+
+実行応答フォーマット：
+
+* すべての実行応答は必ず 2 段：
+      * `1,<結果要約...>`
+      * `2,<詳細プロセス...>`
+* `--silent` は使用しません。
+
 このモデルは「段階的権限付与」をサポートします。
 
 ---
@@ -165,5 +188,16 @@ ALLOWED_USER_IDS=123456789
 | `/new` | 新しい Copilot セッションを開始 |
 | `/sessions` | 最近のセッション一覧 |
 | `/use <id>` | セッションを切り替え |
+| `/agent` | 現在の agent を表示 |
+| `/agent <name>` | 現在の agent を設定（Copilot 実行時に `--agent <name>` を付与） |
+| `/agent clear` | 現在の agent を解除 |
 
 通常メッセージは現在のセッションに自動で継続します。
+
+---
+
+## 永続化と監査
+
+* `approval_store.json`：grants / pending / user session / user agent を保存。
+* `audit_log.jsonl`：承認・実行イベントを JSONL 追記。
+* `callback_query` を処理し、`answerCallbackQuery` を必ず返します。

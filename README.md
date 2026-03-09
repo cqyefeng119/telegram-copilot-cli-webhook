@@ -153,6 +153,29 @@ ALLOWED_USER_IDS=123456789
 * High-risk commands: reviewed one by one
 * Process can be stopped at any time
 
+Approval model (MVP):
+
+* Plan-first (action planning) is enabled by default.
+* If plan parsing fails or confidence is too low, the request fails closed into approval.
+* Any network action with newly seen/unauthorized domains always requires approval.
+* Evidence screenshots can be controlled by planned `needs_evidence` (with a switch to fall back to keyword detection).
+* High-risk requests are denied by default and converted into a Telegram approval card.
+* Inline buttons:
+      * ✅ One-time only
+      * 🔁 Allow same risk type for this conversation
+      * 📁 Allow same risk type for this project
+      * 🤖 Allow same risk type for this agent (shown only when an agent is set)
+      * ❌ Deny
+* Layered permission resolution: user > agent > project > conversation > one-time.
+* Allow grants inherit downward; deny applies only to the current pending request.
+
+Execution receipt format:
+
+* Every execution reply is always two-stage:
+      * `1,<result summary...>`
+      * `2,<detailed process...>`
+* Silent mode is removed (`--silent` is no longer used).
+
 This model supports "incremental permission granting."
 
 ---
@@ -165,5 +188,16 @@ This model supports "incremental permission granting."
 | `/new` | Start new Copilot session |
 | `/sessions` | List recent sessions |
 | `/use <id>` | Switch to session |
+| `/agent` | Show current agent |
+| `/agent <name>` | Set current agent (passed to Copilot as `--agent <name>`) |
+| `/agent clear` | Clear current agent |
 
 Normal messages automatically continue the current session.
+
+---
+
+## Persistence & Audit
+
+* `approval_store.json`: stores grants, pending approvals, user session mapping, user agent mapping.
+* `audit_log.jsonl`: append-only audit trail for approval and execution events.
+* `callback_query` updates are handled and always acknowledged with `answerCallbackQuery`.
