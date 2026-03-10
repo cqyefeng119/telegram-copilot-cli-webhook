@@ -11,7 +11,7 @@ import secrets
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 # Prefer loading environment variables from the .env file in the same directory
@@ -53,9 +53,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-PLAN_FIRST_MODE = _env_flag("PLAN_FIRST_MODE", True)
 PLAN_CONFIDENCE_THRESHOLD = _env_float("PLAN_CONFIDENCE_THRESHOLD", 0.7)
-EVIDENCE_LLM_ENABLED = _env_flag("EVIDENCE_LLM_ENABLED", True)
+SHADOW_ENFORCEMENT_ENABLED = _env_flag("SHADOW_ENFORCEMENT_ENABLED", False)
+_raw_shadow_enforcement_scope = (os.getenv("SHADOW_ENFORCEMENT_SCOPE") or "deny_only").strip().lower()
+SHADOW_ENFORCEMENT_SCOPE: Literal["deny_only", "deny_and_challenge"] = (
+    _raw_shadow_enforcement_scope
+    if _raw_shadow_enforcement_scope in {"deny_only", "deny_and_challenge"}
+    else "deny_only"
+)
 
 _WEBHOOK_DIR = Path(__file__).parent
 TELEGRAM_MEDIA_DIR = os.getenv("TELEGRAM_MEDIA_DIR") or str(_WEBHOOK_DIR / "media" / "received")
@@ -84,21 +89,6 @@ if RAW_SCREENSHOT_EXTENSIONS.strip():
     }
 else:
     SCREENSHOT_EXTENSIONS = DEFAULT_SCREENSHOT_EXTENSIONS
-
-EVIDENCE_TRIGGER_PATTERNS = [
-    re.compile(r"\b(send|show|attach|provide)\b.{0,40}\b(screenshot|evidence|proof)\b", re.IGNORECASE),
-    re.compile(r"\b(screenshot|evidence|proof)\b.{0,40}\b(send|show|attach|provide)\b", re.IGNORECASE),
-    # Chinese patterns: 截图/证据/截屏 combined with 发/给/看/展示
-    re.compile(r"(截图|截屏|屏幕截图).{0,20}(发|给|看|展示|作为证据)", re.IGNORECASE),
-    re.compile(r"(发|给|展示).{0,20}(截图|截屏|屏幕截图|证据)", re.IGNORECASE),
-    re.compile(r"作为证据", re.IGNORECASE),
-]
-
-HIGH_RISK_RULES: list[tuple[str, re.Pattern[str]]] = [
-    ("destructive", re.compile(r"\b(rm|remove|del|delete|drop|truncate|format|wipe|shutdown|reboot|kill)\b|删除|删掉|移除|清空|格式化|抹掉|削除|消去", re.IGNORECASE)),
-    ("repo_write", re.compile(r"\b(git\s+push|git\s+commit|git\s+reset|git\s+rebase|force\s+push)\b", re.IGNORECASE)),
-    ("secret", re.compile(r"\b(password|secret|token|credential|api\s*key)\b", re.IGNORECASE)),
-]
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 _BARE_DOMAIN_PATTERN = re.compile(
@@ -144,6 +134,7 @@ def _empty_store() -> dict[str, Any]:
     return {
         "user_sessions": {},
         "user_agents": {},
+        "user_models": {},
         "grants": [],
         "domain_grants": [],
         "pending": {},
@@ -165,6 +156,8 @@ def _load_store() -> dict[str, Any]:
                     base["user_sessions"] = {}
                 if not isinstance(base.get("user_agents"), dict):
                     base["user_agents"] = {}
+                if not isinstance(base.get("user_models"), dict):
+                    base["user_models"] = {}
                 if not isinstance(base.get("domain_grants"), list):
                     base["domain_grants"] = []
                 return base
@@ -248,12 +241,128 @@ def _save_user_agents(agents: dict[int, str | None]) -> None:
 USER_ACTIVE_AGENT: dict[int, str | None] = _load_user_agents()
 
 
-def _classify_risk(text: str) -> tuple[bool, str, str]:
-    candidate = (text or "").strip()
-    for risk_kind, pattern in HIGH_RISK_RULES:
-        if pattern.search(candidate):
-            return True, risk_kind, pattern.pattern
-    return False, "general", "none"
+def _load_user_models() -> dict[int, str | None]:
+    try:
+        data = _RUNTIME_STORE.get("user_models") or {}
+        return {int(k): v for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_user_models(models: dict[int, str | None]) -> None:
+    try:
+        _RUNTIME_STORE["user_models"] = {str(k): v for k, v in models.items()}
+        _save_store()
+    except Exception as exc:
+        _safe_log(f"[model persist] failed to save: {exc}")
+
+
+USER_ACTIVE_MODEL: dict[int, str | None] = _load_user_models()
+
+
+def _extract_frontmatter_name(agent_file: Path) -> str | None:
+    try:
+        text = agent_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    if not text.startswith("---"):
+        return None
+
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+
+    try:
+        frontmatter = yaml.safe_load(parts[1])
+    except Exception:
+        return None
+
+    if not isinstance(frontmatter, dict):
+        return None
+    name = str(frontmatter.get("name") or "").strip()
+    return name or None
+
+
+def _discover_agent_names() -> list[str]:
+    start = Path.cwd().resolve()
+    roots: list[Path] = []
+    cur = start
+    while True:
+        roots.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    names: set[str] = set()
+    for root in roots:
+        agents_dir = root / ".github" / "agents"
+        if not agents_dir.exists() or not agents_dir.is_dir():
+            continue
+        for file_path in sorted(agents_dir.glob("*.agent.md")):
+            name = _extract_frontmatter_name(file_path)
+            if name:
+                names.add(name)
+
+    return sorted(names)
+
+
+def _discover_models_from_copilot_package() -> tuple[list[dict[str, Any]], str | None]:
+    candidates: list[Path] = []
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "npm" / "node_modules" / "@github" / "copilot" / "sdk" / "index.d.ts")
+
+    userprofile = os.getenv("USERPROFILE")
+    if userprofile:
+        candidates.append(
+            Path(userprofile)
+            / "AppData"
+            / "Roaming"
+            / "npm"
+            / "node_modules"
+            / "@github"
+            / "copilot"
+            / "sdk"
+            / "index.d.ts"
+        )
+
+    dts_file = next((path for path in candidates if path.exists() and path.is_file()), None)
+    if not dts_file:
+        return [], "copilot SDK typings not found"
+
+    try:
+        text = dts_file.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return [], f"failed to read SDK typings: {exc}"
+
+    enum_match = re.search(r"SUPPORTED_MODELS:\s*readonly\s*\[(.*?)\];", text, re.DOTALL)
+    if not enum_match:
+        return [], "SUPPORTED_MODELS not found in SDK typings"
+
+    raw_models = re.findall(r'"([^"]+)"', enum_match.group(1))
+    if not raw_models:
+        return [], "no models found in SUPPORTED_MODELS"
+
+    seen: set[str] = set()
+    models: list[dict[str, Any]] = []
+    for model_id in raw_models:
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+
+        lowered = model_id.lower()
+        if "max" in lowered:
+            multiplier = 3
+        elif "mini" in lowered:
+            multiplier = 0
+        else:
+            multiplier = 1
+
+        models.append({"id": model_id, "multiplier": multiplier})
+
+    return models, None
 
 
 def _normalize_domain(raw: str) -> str | None:
@@ -402,11 +511,14 @@ def _plan_actions_with_copilot(
     user_prompt: str,
     current_session: str | None,
     agent_name: str | None,
+    model_id: str | None,
 ) -> dict[str, Any]:
     plan_prompt = _build_plan_prompt(user_prompt)
     copilot_args = ["-p", plan_prompt]
     if agent_name:
         copilot_args.extend(["--agent", agent_name])
+    if model_id:
+        copilot_args.extend(["--model", model_id])
     if current_session:
         copilot_args = ["--resume", current_session] + copilot_args
 
@@ -463,13 +575,21 @@ def _match_grant(grant: dict[str, Any], scope: str, scope_id: str, risk_kind: st
     return grant_risk == risk_kind or grant_risk == "*"
 
 
-def _resolve_allow_scope(user_id: int, agent_name: str | None, current_session: str | None, risk_kind: str) -> str | None:
-    scopes = [
+def _build_authorization_scopes(
+    user_id: int,
+    agent_name: str | None,
+    current_session: str | None,
+) -> tuple[tuple[str, str], ...]:
+    return (
         ("user", str(user_id)),
         ("agent", agent_name or ""),
         ("project", PROJECT_SCOPE_KEY),
         ("conversation", current_session or "new-session"),
-    ]
+    )
+
+
+def _resolve_allow_scope(user_id: int, agent_name: str | None, current_session: str | None, risk_kind: str) -> str | None:
+    scopes = _build_authorization_scopes(user_id, agent_name, current_session)
     grants = _iter_allow_grants()
     for scope, scope_id in scopes:
         if not scope_id:
@@ -534,12 +654,7 @@ def _resolve_domain_allow_scope(
     if not normalized_domains:
         return None
 
-    scopes = [
-        ("user", str(user_id)),
-        ("agent", agent_name or ""),
-        ("project", PROJECT_SCOPE_KEY),
-        ("conversation", current_session or "new-session"),
-    ]
+    scopes = _build_authorization_scopes(user_id, agent_name, current_session)
     grants = _iter_domain_grants()
 
     for scope, scope_id in scopes:
@@ -559,6 +674,129 @@ def _resolve_domain_allow_scope(
     ):
         return "mixed"
     return None
+
+
+class _PlanPolicyDecision(TypedDict):
+    plan_fail_closed: bool
+    requires_approval: bool
+    effective_risk_kind: str
+    effective_reason: str
+    allow_scope: str | None
+    approval_source: str
+
+
+class _ShadowStrategyRecommendation(TypedDict):
+    strategy: str
+    reason_codes: list[str]
+    confidence: float
+    summary: str
+
+
+def _decide_shadow_enforcement(
+    *,
+    enabled: bool,
+    scope: Literal["deny_only", "deny_and_challenge"],
+    strategy: str,
+) -> Literal["pass", "force_challenge", "force_deny"]:
+    if not enabled:
+        return "pass"
+    if strategy == "deny":
+        return "force_deny"
+    if scope == "deny_and_challenge" and strategy == "challenge":
+        return "force_challenge"
+    return "pass"
+
+
+def _recommend_shadow_strategy(
+    *,
+    plan_fail_closed: bool,
+    has_network_action: bool,
+    unauthorized_domains: list[str],
+    missing_risk_kinds: list[str],
+    planned_action_types: list[str],
+) -> _ShadowStrategyRecommendation:
+    reason_codes: list[str] = []
+
+    if plan_fail_closed:
+        reason_codes.append("plan_fail_closed")
+    if has_network_action and unauthorized_domains:
+        reason_codes.append("unauthorized_domains")
+
+    sensitive_action_types = {"destructive", "repo_write", "secret"}
+    if missing_risk_kinds:
+        reason_codes.append("missing_risk_kinds")
+    if any(action_type in sensitive_action_types for action_type in planned_action_types):
+        reason_codes.append("sensitive_action_type")
+
+    if plan_fail_closed or (has_network_action and bool(unauthorized_domains)):
+        strategy = "deny"
+        confidence = 0.98
+    elif missing_risk_kinds or any(action_type in sensitive_action_types for action_type in planned_action_types):
+        strategy = "challenge"
+        confidence = 0.87
+    else:
+        strategy = "allow"
+        confidence = 0.72
+
+    summary = f"shadow strategy={strategy}; reasons={','.join(reason_codes) if reason_codes else 'none'}"
+    return {
+        "strategy": strategy,
+        "reason_codes": reason_codes,
+        "confidence": confidence,
+        "summary": summary,
+    }
+
+
+def _decide_plan_policy(
+    *,
+    plan_parse_ok: bool,
+    plan_confidence: float,
+    plan_confidence_threshold: float,
+    missing_risk_kinds: list[str],
+    has_network_action: bool,
+    unauthorized_domains: list[str],
+    risk_scopes: dict[str, str | None],
+    network_allow_scope: str | None,
+) -> _PlanPolicyDecision:
+    plan_fail_closed = not plan_parse_ok or plan_confidence < plan_confidence_threshold
+    requires_approval = plan_fail_closed or bool(missing_risk_kinds) or (has_network_action and bool(unauthorized_domains))
+
+    effective_risk_kind = "plan"
+    reason_parts: list[str] = []
+    if plan_fail_closed:
+        if not plan_parse_ok:
+            reason_parts.append("action plan 解析失败（fail-closed）")
+        else:
+            reason_parts.append(f"action plan 置信度过低: {plan_confidence:.2f} < {plan_confidence_threshold:.2f}")
+    if missing_risk_kinds:
+        effective_risk_kind = missing_risk_kinds[0]
+        reason_parts.append(f"高风险动作未授权: {', '.join(missing_risk_kinds)}")
+    if has_network_action and unauthorized_domains:
+        effective_risk_kind = "network"
+        shown_domains = unauthorized_domains
+        domain_text = ", ".join(shown_domains[:5])
+        more = "" if len(shown_domains) <= 5 else f" (+{len(shown_domains) - 5})"
+        reason_parts.append(f"未授权网络域名: {domain_text}{more}" if domain_text else "未授权网络访问")
+    effective_reason = "；".join(reason_parts) if reason_parts else "需审批"
+
+    allow_scope = None
+    if risk_scopes:
+        allow_scope = ",".join(sorted({scope for scope in risk_scopes.values() if scope}))
+
+    approval_source = (
+        f"auto:risk:{allow_scope}"
+        if allow_scope
+        else (f"auto:network:{network_allow_scope}" if network_allow_scope else "auto:low-risk")
+    )
+
+    return {
+        "plan_fail_closed": plan_fail_closed,
+        "requires_approval": requires_approval,
+        "effective_risk_kind": effective_risk_kind,
+        "effective_reason": effective_reason,
+        "allow_scope": allow_scope,
+        "approval_source": approval_source,
+    }
 
 
 def _upsert_domain_grant(scope: str, scope_id: str, domain: str, by_user_id: int) -> None:
@@ -772,7 +1010,53 @@ def _render_sessions(current_id: str | None, limit: int = 10) -> str:
         title = _get_session_title(session_id)
         title_part = f"  {title}" if title else ""
         lines.append(f"{idx}. `{session_id[:8]}` ({rel_time}){marker}{title_part}")
-    lines.append("\nUsage: /use <number>  e.g. /use 2")
+    lines.append("\nUsage: /session <number>  e.g. /session 2")
+    return "\n".join(lines)
+
+
+def _render_agents(current_agent: str | None) -> str:
+    discovered = _discover_agent_names()
+    options: list[str | None] = [None] + discovered
+
+    lines = ["Available agents:"]
+    for idx, agent in enumerate(options, start=1):
+        label = "none" if agent is None else agent
+        selected = (agent is None and not current_agent) or (agent is not None and agent == current_agent)
+        marker = " ✅" if selected else ""
+        lines.append(f"{idx}. `{label}`{marker}")
+
+    lines.append("\nUsage: /agent <number>  e.g. /agent 2")
+    return "\n".join(lines)
+
+
+def _resolve_effective_model(explicit_model: str | None, models: list[dict[str, Any]]) -> tuple[str | None, bool]:
+    available_ids = [str(model.get("id") or "").strip() for model in models]
+    available_ids = [model_id for model_id in available_ids if model_id]
+
+    explicit = (explicit_model or "").strip()
+    if explicit and explicit in available_ids:
+        return explicit, True
+
+    if available_ids:
+        return available_ids[0], False
+
+    return None, False
+
+
+def _render_models(current_model: str | None, models: list[dict[str, Any]]) -> str:
+    lines = ["Available models:"]
+    for idx, model in enumerate(models, start=1):
+        model_id = str(model.get("id") or "")
+        raw_multiplier = model.get("multiplier")
+        try:
+            multiplier = int(raw_multiplier) if raw_multiplier is not None else 1
+        except (TypeError, ValueError):
+            multiplier = 1
+        selected = current_model == model_id
+        marker = " ✅" if selected else ""
+        lines.append(f"{idx}. `{model_id}` (x{multiplier}){marker}")
+
+    lines.append("\nUsage: /model <number>  e.g. /model 3")
     return "\n".join(lines)
 
 
@@ -783,10 +1067,11 @@ def _render_help() -> str:
             "/help - Show help",
             "/new - Start a fresh session (next normal message creates a new session)",
             "/sessions - List recent sessions",
-            "/use <id> - Switch to a specific session (prefix is supported)",
-            "/agent - Show current agent",
-            "/agent <name> - Set current agent",
-            "/agent clear - Clear current agent",
+            "/session <id> - Switch to a session by list number",
+            "/agents - List available agents",
+            "/agent <id> - Set agent by list number (1 = none)",
+            "/models - List available models",
+            "/model <id> - Set model by list number",
             "",
             "Default behavior:",
             "- A normal message continues the current session.",
@@ -915,12 +1200,276 @@ def _render_approval_prompt(
     )
 
 
+async def _handle_callback_approval(callback_query: dict[str, Any] | None) -> bool:
+    if not callback_query:
+        return False
+
+    callback_id = callback_query.get("id")
+    callback_data = callback_query.get("data") or ""
+    callback_user_id = callback_query.get("from", {}).get("id")
+    callback_chat_id = (callback_query.get("message") or {}).get("chat", {}).get("id")
+
+    if not callback_id:
+        return True
+
+    if ALLOWED_USER_IDS and callback_user_id not in ALLOWED_USER_IDS:
+        await _answer_callback_query(callback_id, "Not allowed")
+        return True
+
+    if not callback_data.startswith("ap:"):
+        await _answer_callback_query(callback_id, "Unknown action")
+        return True
+
+    parts = callback_data.split(":", maxsplit=2)
+    if len(parts) != 3:
+        await _answer_callback_query(callback_id, "Malformed action")
+        return True
+
+    pending_id = parts[1]
+    action = parts[2]
+    valid_actions = {"once", "conversation", "project", "agent", "deny"}
+    if action not in valid_actions:
+        await _answer_callback_query(callback_id, "Unknown action")
+        return True
+
+    pending_map = _RUNTIME_STORE.get("pending") or {}
+    pending = pending_map.get(pending_id)
+    if not pending:
+        await _answer_callback_query(callback_id, "审批单不存在或已处理")
+        return True
+
+    if int(pending.get("user_id", 0) or 0) != int(callback_user_id or 0):
+        await _answer_callback_query(callback_id, "只能由原请求用户审批")
+        return True
+
+    pending_payload = pending
+    risk_kind = str(pending_payload.get("risk_kind") or "general")
+    risk_kinds_raw = pending_payload.get("risk_kinds") or []
+    risk_kinds = [str(item).strip() for item in risk_kinds_raw if str(item).strip()]
+    if not risk_kinds and risk_kind != "general":
+        risk_kinds = [risk_kind]
+    agent_name = pending_payload.get("agent_name")
+    model_id = pending_payload.get("model_id")
+    current_session = pending_payload.get("current_session")
+
+    if action == "deny":
+        _pop_pending(pending_id)
+        await _answer_callback_query(callback_id, "已拒绝（仅本次）")
+        if callback_chat_id:
+            await _send_telegram_message(callback_chat_id, "已拒绝本次高风险操作。")
+        _append_audit("approval_deny_once", {
+            "pending_id": pending_id,
+            "user_id": callback_user_id,
+            "risk_kind": risk_kind,
+            "risk_kinds": risk_kinds,
+        })
+        return True
+
+    if action in {"conversation", "project", "agent"}:
+        if action == "conversation":
+            scope_id = current_session or "new-session"
+        elif action == "project":
+            scope_id = PROJECT_SCOPE_KEY
+        else:
+            if not agent_name:
+                await _answer_callback_query(callback_id, "当前请求无 agent 上下文")
+                return True
+            scope_id = agent_name
+        for item in risk_kinds:
+            _upsert_allow_grant(action, scope_id, item, int(callback_user_id))
+        for domain in pending_payload.get("domains") or []:
+            _upsert_domain_grant(action, scope_id, str(domain), int(callback_user_id))
+        _append_audit("approval_grant", {
+            "pending_id": pending_id,
+            "user_id": callback_user_id,
+            "scope": action,
+            "scope_id": scope_id,
+            "risk_kind": risk_kind,
+            "risk_kinds": risk_kinds,
+            "domains": pending_payload.get("domains") or [],
+        })
+
+    pending_payload = _pop_pending(pending_id)
+    if not pending_payload:
+        await _answer_callback_query(callback_id, "审批单已过期")
+        return True
+
+    await _answer_callback_query(callback_id, "已批准，开始执行")
+    await _execute_copilot(
+        user_id=int(pending_payload["user_id"]),
+        chat_id=int(pending_payload["chat_id"]),
+        copilot_prompt=str(pending_payload["copilot_prompt"]),
+        current_session=current_session,
+        agent_name=agent_name,
+        model_id=model_id,
+        evidence_requested=bool(pending_payload.get("evidence_requested", False)),
+        approval_source=f"callback:{action}",
+    )
+    return True
+
+
+async def _handle_command_message(user_id: int, chat_id: int | None, normalized_text: str) -> bool:
+    if normalized_text == "/new":
+        USER_ACTIVE_SESSION[user_id] = None
+        _save_user_sessions(USER_ACTIVE_SESSION)
+        if chat_id:
+            await _send_telegram_message(chat_id, "Switched to new-session mode. Your next normal message will create a new session.")
+        return True
+
+    if normalized_text == "/help":
+        if chat_id:
+            await _send_telegram_message(chat_id, _render_help())
+        return True
+
+    if normalized_text == "/sessions":
+        current_session = USER_ACTIVE_SESSION.get(user_id)
+        if chat_id:
+            await _send_telegram_message(chat_id, _render_sessions(current_session, limit=SESSION_LIST_LIMIT))
+        return True
+
+    if normalized_text.startswith("/session"):
+        parts = normalized_text.split(maxsplit=1)
+        if len(parts) < 2:
+            if chat_id:
+                await _send_telegram_message(chat_id, "Usage: /session <number>")
+            return True
+
+        raw_number = parts[1].strip().lstrip("#")
+        if not raw_number.isdigit():
+            if chat_id:
+                await _send_telegram_message(chat_id, "Invalid session id. Use /sessions and pick a number.")
+            return True
+
+        idx = int(raw_number) - 1
+        all_sessions = _list_sessions(limit=200)
+        if idx < 0 or idx >= len(all_sessions):
+            if chat_id:
+                await _send_telegram_message(chat_id, f"Invalid session id: {raw_number}. Run /sessions first.")
+            return True
+
+        resolved = all_sessions[idx]
+        USER_ACTIVE_SESSION[user_id] = resolved
+        _save_user_sessions(USER_ACTIVE_SESSION)
+        if chat_id:
+            await _send_telegram_message(chat_id, f"Switched to session: {resolved}")
+        return True
+
+    if normalized_text == "/agents":
+        current_agent = USER_ACTIVE_AGENT.get(user_id)
+        if chat_id:
+            await _send_telegram_message(chat_id, _render_agents(current_agent))
+        return True
+
+    if normalized_text.startswith("/agent"):
+        parts = normalized_text.split(maxsplit=1)
+        if len(parts) == 1:
+            current_agent = USER_ACTIVE_AGENT.get(user_id)
+            if chat_id:
+                await _send_telegram_message(chat_id, f"Current agent: {current_agent or '-'}")
+            return True
+
+        raw_number = parts[1].strip().lstrip("#")
+        if not raw_number.isdigit():
+            if chat_id:
+                await _send_telegram_message(chat_id, "Invalid agent id. Use /agents and pick a number.")
+            return True
+
+        selected_idx = int(raw_number)
+        discovered = _discover_agent_names()
+        options: list[str | None] = [None] + discovered
+        if selected_idx < 1 or selected_idx > len(options):
+            if chat_id:
+                await _send_telegram_message(chat_id, f"Invalid agent id: {selected_idx}. Run /agents first.")
+            return True
+
+        selected_agent = options[selected_idx - 1]
+        if selected_agent is None:
+            USER_ACTIVE_AGENT[user_id] = None
+            _save_user_agents(USER_ACTIVE_AGENT)
+            if chat_id:
+                await _send_telegram_message(chat_id, "Agent cleared for this user.")
+            return True
+
+        USER_ACTIVE_AGENT[user_id] = selected_agent
+        _save_user_agents(USER_ACTIVE_AGENT)
+        if chat_id:
+            await _send_telegram_message(chat_id, f"Agent set: {selected_agent}")
+        return True
+
+    if normalized_text == "/models":
+        models, model_error = _discover_models_from_copilot_package()
+        if chat_id:
+            if not models:
+                await _send_telegram_message(
+                    chat_id,
+                    f"No models discovered from installed Copilot package. ({model_error or 'unknown error'})",
+                )
+            else:
+                explicit_model = USER_ACTIVE_MODEL.get(user_id)
+                current_model, _ = _resolve_effective_model(explicit_model, models)
+                await _send_telegram_message(chat_id, _render_models(current_model, models))
+        return True
+
+    if normalized_text.startswith("/model"):
+        parts = normalized_text.split(maxsplit=1)
+        if len(parts) == 1:
+            if chat_id:
+                models, model_error = _discover_models_from_copilot_package()
+                if not models:
+                    await _send_telegram_message(
+                        chat_id,
+                        f"No models discovered from installed Copilot package. ({model_error or 'unknown error'})",
+                    )
+                else:
+                    explicit_model = USER_ACTIVE_MODEL.get(user_id)
+                    current_model, is_explicit = _resolve_effective_model(explicit_model, models)
+                    suffix = "" if is_explicit or not current_model else " (default)"
+                    await _send_telegram_message(chat_id, f"Current model: {current_model or '-'}{suffix}")
+            return True
+
+        raw_number = parts[1].strip().lstrip("#")
+        if not raw_number.isdigit():
+            if chat_id:
+                await _send_telegram_message(chat_id, "Invalid model id. Use /models and pick a number.")
+            return True
+
+        models, model_error = _discover_models_from_copilot_package()
+        if not models:
+            if chat_id:
+                await _send_telegram_message(
+                    chat_id,
+                    f"No models discovered from installed Copilot package. ({model_error or 'unknown error'})",
+                )
+            return True
+
+        selected_idx = int(raw_number)
+        if selected_idx < 1 or selected_idx > len(models):
+            if chat_id:
+                await _send_telegram_message(chat_id, f"Invalid model id: {selected_idx}. Run /models first.")
+            return True
+
+        selected_model = str(models[selected_idx - 1].get("id") or "").strip()
+        if not selected_model:
+            if chat_id:
+                await _send_telegram_message(chat_id, "Failed to resolve selected model id.")
+            return True
+
+        USER_ACTIVE_MODEL[user_id] = selected_model
+        _save_user_models(USER_ACTIVE_MODEL)
+        if chat_id:
+            await _send_telegram_message(chat_id, f"Model set: {selected_model}")
+        return True
+
+    return False
+
+
 async def _execute_copilot(
     user_id: int,
     chat_id: int,
     copilot_prompt: str,
     current_session: str | None,
     agent_name: str | None,
+    model_id: str | None,
     evidence_requested: bool,
     approval_source: str,
 ) -> None:
@@ -942,6 +1491,8 @@ async def _execute_copilot(
     copilot_args = ["-p", copilot_prompt, "--allow-all-tools"]
     if agent_name:
         copilot_args.extend(["--agent", agent_name])
+    if model_id:
+        copilot_args.extend(["--model", model_id])
     if current_session:
         copilot_args = ["--resume", current_session] + copilot_args
 
@@ -955,7 +1506,10 @@ async def _execute_copilot(
             timeout=COPILOT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        detail = f"status=timeout; timeout={COPILOT_TIMEOUT_SECONDS}s; approval={approval_source}; session={current_session or 'new'}; agent={agent_name or '-'}"
+        detail = (
+            f"status=timeout; timeout={COPILOT_TIMEOUT_SECONDS}s; approval={approval_source}; "
+            f"session={current_session or 'new'}; agent={agent_name or '-'}; model={model_id or '-'}"
+        )
         await _send_telegram_message(chat_id, _format_two_stage_receipt("执行超时", detail))
         _append_audit("execution_timeout", {
             "user_id": user_id,
@@ -963,10 +1517,14 @@ async def _execute_copilot(
             "approval_source": approval_source,
             "session": current_session,
             "agent": agent_name,
+            "model": model_id,
         })
         return
     except Exception as exc:
-        detail = f"status=launch_error; approval={approval_source}; session={current_session or 'new'}; agent={agent_name or '-'}"
+        detail = (
+            f"status=launch_error; approval={approval_source}; session={current_session or 'new'}; "
+            f"agent={agent_name or '-'}; model={model_id or '-'}"
+        )
         await _send_telegram_message(chat_id, _format_two_stage_receipt(f"启动失败: {exc}", detail))
         _append_audit("execution_launch_error", {
             "user_id": user_id,
@@ -974,6 +1532,7 @@ async def _execute_copilot(
             "approval_source": approval_source,
             "session": current_session,
             "agent": agent_name,
+            "model": model_id,
             "error": str(exc),
         })
         return
@@ -1006,7 +1565,7 @@ async def _execute_copilot(
 
     detail = (
         f"status=done; return_code={result.returncode}; approval={approval_source}; "
-        f"session={USER_ACTIVE_SESSION.get(user_id) or 'new'}; agent={agent_name or '-'}"
+        f"session={USER_ACTIVE_SESSION.get(user_id) or 'new'}; agent={agent_name or '-'}; model={model_id or '-'}"
     )
     await _send_telegram_message(chat_id, _format_two_stage_receipt(result_text, detail))
 
@@ -1017,6 +1576,7 @@ async def _execute_copilot(
         "return_code": result.returncode,
         "session": USER_ACTIVE_SESSION.get(user_id),
         "agent": agent_name,
+        "model": model_id,
     })
 
     if evidence_requested:
@@ -1036,13 +1596,6 @@ async def _execute_copilot(
                 _safe_log("[evidence] explicit request detected, but no screenshot found")
         except Exception as exc:
             _safe_log(f"[evidence send error] {exc}")
-
-
-def _is_explicit_evidence_request(text: str) -> bool:
-    candidate = (text or "").strip()
-    if not candidate:
-        return False
-    return any(pattern.search(candidate) for pattern in EVIDENCE_TRIGGER_PATTERNS)
 
 
 def _find_latest_screenshot(min_mtime: float | None = None) -> Path | None:
@@ -1197,106 +1750,7 @@ def create_app() -> FastAPI:
             return {"ok": True}
 
         callback_query = data.get("callback_query")
-        if callback_query:
-            callback_id = callback_query.get("id")
-            callback_data = callback_query.get("data") or ""
-            callback_user_id = callback_query.get("from", {}).get("id")
-            callback_chat_id = (callback_query.get("message") or {}).get("chat", {}).get("id")
-
-            if not callback_id:
-                return {"ok": True}
-
-            if ALLOWED_USER_IDS and callback_user_id not in ALLOWED_USER_IDS:
-                await _answer_callback_query(callback_id, "Not allowed")
-                return {"ok": True}
-
-            if not callback_data.startswith("ap:"):
-                await _answer_callback_query(callback_id, "Unknown action")
-                return {"ok": True}
-
-            parts = callback_data.split(":", maxsplit=2)
-            if len(parts) != 3:
-                await _answer_callback_query(callback_id, "Malformed action")
-                return {"ok": True}
-
-            pending_id = parts[1]
-            action = parts[2]
-            valid_actions = {"once", "conversation", "project", "agent", "deny"}
-            if action not in valid_actions:
-                await _answer_callback_query(callback_id, "Unknown action")
-                return {"ok": True}
-
-            pending_map = _RUNTIME_STORE.get("pending") or {}
-            pending = pending_map.get(pending_id)
-            if not pending:
-                await _answer_callback_query(callback_id, "审批单不存在或已处理")
-                return {"ok": True}
-
-            if int(pending.get("user_id", 0) or 0) != int(callback_user_id or 0):
-                await _answer_callback_query(callback_id, "只能由原请求用户审批")
-                return {"ok": True}
-
-            pending_payload = pending
-            risk_kind = str(pending_payload.get("risk_kind") or "general")
-            risk_kinds_raw = pending_payload.get("risk_kinds") or []
-            risk_kinds = [str(item).strip() for item in risk_kinds_raw if str(item).strip()]
-            if not risk_kinds and risk_kind != "general":
-                risk_kinds = [risk_kind]
-            agent_name = pending_payload.get("agent_name")
-            current_session = pending_payload.get("current_session")
-
-            if action == "deny":
-                _pop_pending(pending_id)
-                await _answer_callback_query(callback_id, "已拒绝（仅本次）")
-                if callback_chat_id:
-                    await _send_telegram_message(callback_chat_id, "已拒绝本次高风险操作。")
-                _append_audit("approval_deny_once", {
-                    "pending_id": pending_id,
-                    "user_id": callback_user_id,
-                    "risk_kind": risk_kind,
-                    "risk_kinds": risk_kinds,
-                })
-                return {"ok": True}
-
-            if action in {"conversation", "project", "agent"}:
-                if action == "conversation":
-                    scope_id = current_session or "new-session"
-                elif action == "project":
-                    scope_id = PROJECT_SCOPE_KEY
-                else:
-                    if not agent_name:
-                        await _answer_callback_query(callback_id, "当前请求无 agent 上下文")
-                        return {"ok": True}
-                    scope_id = agent_name
-                for item in risk_kinds:
-                    _upsert_allow_grant(action, scope_id, item, int(callback_user_id))
-                for domain in pending_payload.get("domains") or []:
-                    _upsert_domain_grant(action, scope_id, str(domain), int(callback_user_id))
-                _append_audit("approval_grant", {
-                    "pending_id": pending_id,
-                    "user_id": callback_user_id,
-                    "scope": action,
-                    "scope_id": scope_id,
-                    "risk_kind": risk_kind,
-                    "risk_kinds": risk_kinds,
-                    "domains": pending_payload.get("domains") or [],
-                })
-
-            pending_payload = _pop_pending(pending_id)
-            if not pending_payload:
-                await _answer_callback_query(callback_id, "审批单已过期")
-                return {"ok": True}
-
-            await _answer_callback_query(callback_id, "已批准，开始执行")
-            await _execute_copilot(
-                user_id=int(pending_payload["user_id"]),
-                chat_id=int(pending_payload["chat_id"]),
-                copilot_prompt=str(pending_payload["copilot_prompt"]),
-                current_session=current_session,
-                agent_name=agent_name,
-                evidence_requested=bool(pending_payload.get("evidence_requested", False)),
-                approval_source=f"callback:{action}",
-            )
+        if await _handle_callback_approval(callback_query):
             return {"ok": True}
 
         message = data.get("message")
@@ -1315,68 +1769,12 @@ def create_app() -> FastAPI:
         chat_id = message.get("chat", {}).get("id")
         normalized_text = text.strip()
 
-        if normalized_text == "/new":
-            USER_ACTIVE_SESSION[user_id] = None
-            _save_user_sessions(USER_ACTIVE_SESSION)
-            if chat_id:
-                await _send_telegram_message(chat_id, "Switched to new-session mode. Your next normal message will create a new session.")
-            return {"ok": True}
-
-        if normalized_text == "/help":
-            if chat_id:
-                await _send_telegram_message(chat_id, _render_help())
-            return {"ok": True}
-
-        if normalized_text == "/sessions":
-            current_session = USER_ACTIVE_SESSION.get(user_id)
-            if chat_id:
-                await _send_telegram_message(chat_id, _render_sessions(current_session, limit=SESSION_LIST_LIMIT))
-            return {"ok": True}
-
-        if normalized_text.startswith("/agent"):
-            parts = normalized_text.split(maxsplit=1)
-            if len(parts) == 1:
-                current_agent = USER_ACTIVE_AGENT.get(user_id)
-                if chat_id:
-                    await _send_telegram_message(chat_id, f"Current agent: {current_agent or '-'}")
-                return {"ok": True}
-
-            raw_agent = parts[1].strip()
-            if raw_agent.lower() in {"clear", "none", "off"}:
-                USER_ACTIVE_AGENT[user_id] = None
-                _save_user_agents(USER_ACTIVE_AGENT)
-                if chat_id:
-                    await _send_telegram_message(chat_id, "Agent cleared for this user.")
-                return {"ok": True}
-
-            USER_ACTIVE_AGENT[user_id] = raw_agent
-            _save_user_agents(USER_ACTIVE_AGENT)
-            if chat_id:
-                await _send_telegram_message(chat_id, f"Agent set: {raw_agent}")
-            return {"ok": True}
-
-        if normalized_text.startswith("/use"):
-            parts = normalized_text.split(maxsplit=1)
-            if len(parts) < 2:
-                if chat_id:
-                    await _send_telegram_message(chat_id, "Usage: /use <session-id or prefix>")
-                return {"ok": True}
-
-            resolved = _resolve_session_id(parts[1])
-            if not resolved:
-                if chat_id:
-                    await _send_telegram_message(chat_id, "No unique matching session found. Run /sessions first.")
-                return {"ok": True}
-
-            USER_ACTIVE_SESSION[user_id] = resolved
-            _save_user_sessions(USER_ACTIVE_SESSION)
-            if chat_id:
-                await _send_telegram_message(chat_id, f"Switched to session: {resolved}")
+        if await _handle_command_message(user_id, chat_id, normalized_text):
             return {"ok": True}
 
         current_session = USER_ACTIVE_SESSION.get(user_id)
         agent_name = USER_ACTIVE_AGENT.get(user_id)
-        evidence_requested_fallback = _is_explicit_evidence_request(text)
+        model_id = USER_ACTIVE_MODEL.get(user_id)
 
         local_image_path = await _download_telegram_image(user_id, message)
         copilot_prompt = text
@@ -1394,26 +1792,11 @@ def create_app() -> FastAPI:
             "confidence": 0.0,
             "parse_ok": False,
         }
-        if PLAN_FIRST_MODE:
-            copilot_cmd = _resolve_copilot_command()
-            if copilot_cmd:
-                plan_result = _plan_actions_with_copilot(copilot_cmd, copilot_prompt, current_session, agent_name)
-            else:
-                _safe_log("[plan] skipped: copilot command unavailable")
+        copilot_cmd = _resolve_copilot_command()
+        if copilot_cmd:
+            plan_result = _plan_actions_with_copilot(copilot_cmd, copilot_prompt, current_session, agent_name, model_id)
         else:
-            heuristic_actions: list[dict[str, str]] = []
-            heuristic_risky, heuristic_kind, _ = _classify_risk(copilot_prompt)
-            if heuristic_risky:
-                heuristic_actions.append({"type": heuristic_kind, "summary": "heuristic risk match"})
-            if extracted_domains:
-                heuristic_actions.append({"type": "network", "summary": "detected URL/domain in request"})
-            plan_result = {
-                "actions": heuristic_actions,
-                "domains": extracted_domains,
-                "needs_evidence": evidence_requested_fallback,
-                "confidence": 1.0,
-                "parse_ok": True,
-            }
+            _safe_log("[plan] skipped: copilot command unavailable")
 
         plan_parse_ok = bool(plan_result.get("parse_ok"))
         plan_confidence = float(plan_result.get("confidence") or 0.0)
@@ -1457,12 +1840,7 @@ def create_app() -> FastAPI:
         network_allow_scope = _resolve_domain_allow_scope(user_id, agent_name, current_session, planned_domains) if has_network_action else None
         unauthorized_domains: list[str] = []
         if has_network_action:
-            scopes_for_check = [
-                ("user", str(user_id)),
-                ("agent", agent_name or ""),
-                ("project", PROJECT_SCOPE_KEY),
-                ("conversation", current_session or "new-session"),
-            ]
+            scopes_for_check = _build_authorization_scopes(user_id, agent_name, current_session)
             all_domain_grants = _iter_domain_grants()
             for domain in planned_domains:
                 if not any(
@@ -1473,32 +1851,129 @@ def create_app() -> FastAPI:
                 ):
                     unauthorized_domains.append(domain)
 
-        plan_fail_closed = PLAN_FIRST_MODE and (not plan_parse_ok or plan_confidence < PLAN_CONFIDENCE_THRESHOLD)
-        requires_approval = plan_fail_closed or bool(missing_risk_kinds) or (has_network_action and bool(unauthorized_domains))
+        decision = _decide_plan_policy(
+            plan_parse_ok=plan_parse_ok,
+            plan_confidence=plan_confidence,
+            plan_confidence_threshold=PLAN_CONFIDENCE_THRESHOLD,
+            missing_risk_kinds=missing_risk_kinds,
+            has_network_action=has_network_action,
+            unauthorized_domains=unauthorized_domains,
+            risk_scopes=risk_scopes,
+            network_allow_scope=network_allow_scope,
+        )
 
-        if EVIDENCE_LLM_ENABLED:
-            evidence_requested = bool(plan_result.get("needs_evidence", False))
-        else:
-            evidence_requested = evidence_requested_fallback
+        evidence_requested = bool(plan_result.get("needs_evidence", False))
 
-        if requires_approval:
-            effective_risk_kind = "plan"
-            reason_parts: list[str] = []
-            if plan_fail_closed:
-                if not plan_parse_ok:
-                    reason_parts.append("action plan 解析失败（fail-closed）")
-                else:
-                    reason_parts.append(f"action plan 置信度过低: {plan_confidence:.2f} < {PLAN_CONFIDENCE_THRESHOLD:.2f}")
-            if missing_risk_kinds:
-                effective_risk_kind = missing_risk_kinds[0]
-                reason_parts.append(f"高风险动作未授权: {', '.join(missing_risk_kinds)}")
-            if has_network_action and unauthorized_domains:
-                effective_risk_kind = "network"
-                shown_domains = unauthorized_domains
-                domain_text = ", ".join(shown_domains[:5])
-                more = "" if len(shown_domains) <= 5 else f" (+{len(shown_domains) - 5})"
-                reason_parts.append(f"未授权网络域名: {domain_text}{more}" if domain_text else "未授权网络访问")
-            effective_reason = "；".join(reason_parts) if reason_parts else "需审批"
+        planned_action_types = sorted({action.get("type") for action in planned_actions if action.get("type")})
+        execution_path = "approval_gate" if decision["requires_approval"] else "direct_execute"
+        _append_audit("plan_policy_decision", {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "session": current_session,
+            "agent": agent_name,
+            "model": model_id,
+            "plan_parse_ok": plan_parse_ok,
+            "plan_confidence": plan_confidence,
+            "planned_action_types": planned_action_types,
+            "planned_action_count": len(planned_actions),
+            "planned_domains_count": len(planned_domains),
+            "unauthorized_domains_count": len(unauthorized_domains),
+            "missing_risk_kinds": missing_risk_kinds,
+            "requires_approval": decision["requires_approval"],
+            "plan_fail_closed": decision["plan_fail_closed"],
+            "effective_risk_kind": decision["effective_risk_kind"],
+            "effective_reason": decision["effective_reason"],
+            "allow_scope": decision["allow_scope"],
+            "network_allow_scope": network_allow_scope,
+            "approval_source": decision["approval_source"],
+            "evidence_requested": evidence_requested,
+            "execution_path": execution_path,
+        })
+
+        shadow_recommendation = _recommend_shadow_strategy(
+            plan_fail_closed=decision["plan_fail_closed"],
+            has_network_action=has_network_action,
+            unauthorized_domains=unauthorized_domains,
+            missing_risk_kinds=missing_risk_kinds,
+            planned_action_types=planned_action_types,
+        )
+        _append_audit("shadow_strategy_recommendation", {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "session": current_session,
+            "agent": agent_name,
+            "model": model_id,
+            "strategy": shadow_recommendation["strategy"],
+            "reason_codes": shadow_recommendation["reason_codes"],
+            "confidence": shadow_recommendation["confidence"],
+            "summary": shadow_recommendation["summary"],
+            "audit_only": True,
+            "pre_enforcement_requires_approval": decision["requires_approval"],
+            "pre_enforcement_execution_path": execution_path,
+            "planned_action_types": planned_action_types,
+            "planned_action_count": len(planned_actions),
+            "missing_risk_kinds": missing_risk_kinds,
+            "unauthorized_domains_count": len(unauthorized_domains),
+            "plan_fail_closed": decision["plan_fail_closed"],
+        })
+
+        if SHADOW_ENFORCEMENT_ENABLED:
+            shadow_enforcement_action = _decide_shadow_enforcement(
+                enabled=SHADOW_ENFORCEMENT_ENABLED,
+                scope=SHADOW_ENFORCEMENT_SCOPE,
+                strategy=shadow_recommendation["strategy"],
+            )
+            pre_enforcement_requires_approval = decision["requires_approval"]
+            pre_enforcement_execution_path = "approval_gate" if pre_enforcement_requires_approval else "direct_execute"
+
+            if shadow_enforcement_action == "force_challenge":
+                decision["requires_approval"] = True
+
+            blocked = shadow_enforcement_action == "force_deny"
+            post_enforcement_requires_approval = decision["requires_approval"]
+            post_enforcement_execution_path = (
+                "blocked"
+                if blocked
+                else ("approval_gate" if post_enforcement_requires_approval else "direct_execute")
+            )
+
+            _append_audit("shadow_enforcement_decision", {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "session": current_session,
+                "agent": agent_name,
+                "model": model_id,
+                "scope": SHADOW_ENFORCEMENT_SCOPE,
+                "strategy": shadow_recommendation["strategy"],
+                "action": shadow_enforcement_action,
+                "pre_enforcement_requires_approval": pre_enforcement_requires_approval,
+                "pre_enforcement_execution_path": pre_enforcement_execution_path,
+                "post_enforcement_requires_approval": post_enforcement_requires_approval,
+                "post_enforcement_execution_path": post_enforcement_execution_path,
+                "blocked": blocked,
+            })
+
+            if blocked:
+                _append_audit("shadow_enforcement_blocked", {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "session": current_session,
+                    "agent": agent_name,
+                    "model": model_id,
+                    "scope": SHADOW_ENFORCEMENT_SCOPE,
+                    "strategy": shadow_recommendation["strategy"],
+                    "reason_codes": shadow_recommendation["reason_codes"],
+                    "planned_action_types": planned_action_types,
+                    "unauthorized_domains_count": len(unauthorized_domains),
+                    "missing_risk_kinds": missing_risk_kinds,
+                })
+                if chat_id:
+                    await _send_telegram_message(chat_id, "请求已被策略阻止：检测到高风险拒绝条件。")
+                return {"ok": True}
+
+        if decision["requires_approval"]:
+            effective_risk_kind = decision["effective_risk_kind"]
+            effective_reason = decision["effective_reason"]
             pending_id = _create_pending(
                 {
                     "user_id": user_id,
@@ -1506,6 +1981,7 @@ def create_app() -> FastAPI:
                     "copilot_prompt": copilot_prompt,
                     "current_session": current_session,
                     "agent_name": agent_name,
+                    "model_id": model_id,
                     "evidence_requested": evidence_requested,
                     "risk_kind": effective_risk_kind,
                     "risk_kinds": missing_risk_kinds,
@@ -1523,6 +1999,7 @@ def create_app() -> FastAPI:
                 "reason": effective_reason,
                 "session": current_session,
                 "agent": agent_name,
+                "model": model_id,
                 "domains": unauthorized_domains,
                 "plan_confidence": plan_confidence,
             })
@@ -1541,9 +2018,7 @@ def create_app() -> FastAPI:
                 )
             return {"ok": True}
 
-        allow_scope = None
-        if risk_kinds:
-            allow_scope = ",".join(sorted({scope for scope in risk_scopes.values() if scope}))
+        allow_scope = decision["allow_scope"]
 
         if chat_id:
             await _execute_copilot(
@@ -1552,12 +2027,9 @@ def create_app() -> FastAPI:
                 copilot_prompt=copilot_prompt,
                 current_session=current_session,
                 agent_name=agent_name,
+                model_id=model_id,
                 evidence_requested=evidence_requested,
-                approval_source=(
-                    f"auto:risk:{allow_scope}"
-                    if allow_scope
-                    else (f"auto:network:{network_allow_scope}" if network_allow_scope else "auto:low-risk")
-                ),
+                approval_source=decision["approval_source"],
             )
 
         return {"ok": True}

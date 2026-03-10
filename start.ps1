@@ -122,9 +122,9 @@ if (-not $registered) {
 
 Write-Host ""
 Write-Host "[ready] All services running. Press Ctrl+C to stop." -ForegroundColor Green
-# Keep script alive; wait for uvicorn (always running), or cloudflared if using quick-tunnel
-if ($PUBLIC_URL) {
-    Wait-Process -Id $uvProcess.Id
-} else {
+# Keep script alive; exit when cloudflared exits (or uvicorn when no tunnel process exists)
+if ($cfProcess) {
     Wait-Process -Id $cfProcess.Id
+} else {
+    Wait-Process -Id $uvProcess.Id
 }

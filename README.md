@@ -158,7 +158,7 @@ Approval model (MVP):
 * Plan-first (action planning) is enabled by default.
 * If plan parsing fails or confidence is too low, the request fails closed into approval.
 * Any network action with newly seen/unauthorized domains always requires approval.
-* Evidence screenshots can be controlled by planned `needs_evidence` (with a switch to fall back to keyword detection).
+* Evidence screenshots are controlled by planned `needs_evidence`.
 * High-risk requests are denied by default and converted into a Telegram approval card.
 * Inline buttons:
       * ✅ One-time only
@@ -178,6 +178,16 @@ Execution receipt format:
 
 This model supports "incremental permission granting."
 
+### Shadow Enforcement (Feature Flag)
+
+* Default-off kill switch: `SHADOW_ENFORCEMENT_ENABLED=false` keeps decision/execution behavior on the legacy path, while shadow audit events remain additive.
+* Scope `SHADOW_ENFORCEMENT_SCOPE=deny_only`:
+      * shadow strategy `deny` is hard-blocked (no pending approval card, no execution).
+* Scope `SHADOW_ENFORCEMENT_SCOPE=deny_and_challenge`:
+      * includes `deny_only` behavior;
+      * shadow strategy `challenge` is forced into approval flow.
+* Invalid scope values automatically fall back to `deny_only`.
+
 ---
 
 ## Telegram Commands
@@ -187,10 +197,11 @@ This model supports "incremental permission granting."
 | `/help` | Show help |
 | `/new` | Start new Copilot session |
 | `/sessions` | List recent sessions |
-| `/use <id>` | Switch to session |
-| `/agent` | Show current agent |
-| `/agent <name>` | Set current agent (passed to Copilot as `--agent <name>`) |
-| `/agent clear` | Clear current agent |
+| `/session <id>` | Switch to session by numeric id from `/sessions` |
+| `/agents` | List available agents with numeric ids (`1` is `none`) |
+| `/agent <id>` | Set current agent by numeric id (passed as `--agent <name>`) |
+| `/models` | List available models with numeric ids and multipliers (`x0/x1/x3`) |
+| `/model <id>` | Set current model by numeric id (passed as `--model <id>`) |
 
 Normal messages automatically continue the current session.
 
@@ -198,6 +209,20 @@ Normal messages automatically continue the current session.
 
 ## Persistence & Audit
 
-* `approval_store.json`: stores grants, pending approvals, user session mapping, user agent mapping.
+* `approval_store.json`: stores grants, pending approvals, user session/agent/model mappings.
 * `audit_log.jsonl`: append-only audit trail for approval and execution events.
 * `callback_query` updates are handled and always acknowledged with `answerCallbackQuery`.
+
+### Offline Audit Analyzer (C-Phase4)
+
+Use the stdlib-only analyzer to review audit quality and replay confidence thresholds offline:
+
+```powershell
+# Basic analysis (default: ./audit_log.jsonl, Asia/Shanghai)
+python .\scripts\audit_analyzer.py
+
+# Time/User filter + custom thresholds + JSON output
+python .\scripts\audit_analyzer.py --since 2026-03-09 --until 2026-03-09T23:59:59 --user-id 7212596491 --replay-thresholds 0.6,0.7,0.8,0.9 --json-out .\audit_summary.json
+```
+
+Caveat: historical records may miss fields such as `plan_first_mode`; replay reports any assumptions explicitly in output/hints.

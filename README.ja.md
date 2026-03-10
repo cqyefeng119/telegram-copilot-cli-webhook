@@ -158,7 +158,7 @@ ALLOWED_USER_IDS=123456789
 * デフォルトで plan-first（アクション計画）が有効です。
 * 計画の解析失敗、または信頼度が低い場合は fail-closed で承認フローに入ります。
 * 新規/未許可ドメインを含むネットワーク操作は必ず承認が必要です。
-* 証拠スクリーンショットは計画内の `needs_evidence` で制御でき、必要に応じてキーワード判定へフォールバックできます。
+* 証拠スクリーンショットは計画内の `needs_evidence` で制御します。
 * 高リスク要求はデフォルト拒否で、Telegram の承認カードを発行します。
 * Inline ボタン：
       * ✅ 今回のみ
@@ -178,6 +178,16 @@ ALLOWED_USER_IDS=123456789
 
 このモデルは「段階的権限付与」をサポートします。
 
+### Shadow Enforcement（機能フラグ）
+
+* デフォルト無効：`SHADOW_ENFORCEMENT_ENABLED=false` の場合、意思決定/実行の経路は従来ロジックのままで、shadow 監査イベントのみが追記されます。
+* スコープ `SHADOW_ENFORCEMENT_SCOPE=deny_only`：
+      * shadow 戦略が `deny` のときは強制ブロック（pending 未作成・未実行）。
+* スコープ `SHADOW_ENFORCEMENT_SCOPE=deny_and_challenge`：
+      * `deny_only` を含みます。
+      * shadow 戦略が `challenge` のときは承認フローを強制します。
+* 不正なスコープ値は自動的に `deny_only` へフォールバックします。
+
 ---
 
 ## Telegram コマンド
@@ -187,10 +197,11 @@ ALLOWED_USER_IDS=123456789
 | `/help` | ヘルプを表示 |
 | `/new` | 新しい Copilot セッションを開始 |
 | `/sessions` | 最近のセッション一覧 |
-| `/use <id>` | セッションを切り替え |
-| `/agent` | 現在の agent を表示 |
-| `/agent <name>` | 現在の agent を設定（Copilot 実行時に `--agent <name>` を付与） |
-| `/agent clear` | 現在の agent を解除 |
+| `/session <id>` | `/sessions` の番号でセッションを切り替え |
+| `/agents` | 利用可能な agent を番号付きで表示（`1` は `none`） |
+| `/agent <id>` | 番号で agent を設定（実行時に `--agent <name>` を付与） |
+| `/models` | 利用可能なモデルを番号付きで表示（倍率 `x0/x1/x3` を表示） |
+| `/model <id>` | 番号でモデルを設定（実行時に `--model <id>` を付与） |
 
 通常メッセージは現在のセッションに自動で継続します。
 
@@ -198,6 +209,6 @@ ALLOWED_USER_IDS=123456789
 
 ## 永続化と監査
 
-* `approval_store.json`：grants / pending / user session / user agent を保存。
+* `approval_store.json`：grants / pending / user session / user agent / user model を保存。
 * `audit_log.jsonl`：承認・実行イベントを JSONL 追記。
 * `callback_query` を処理し、`answerCallbackQuery` を必ず返します。

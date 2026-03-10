@@ -159,7 +159,7 @@ ALLOWED_USER_IDS=123456789
 * 默认启用 plan-first（动作计划）。
 * 计划解析失败或置信度不足时，fail-closed 进入审批流程。
 * 网络动作出现新域名/未授权域名时，必须审批。
-* 证据截图可由计划中的 `needs_evidence` 控制（可通过开关回退到关键词判定）。
+* 证据截图由计划中的 `needs_evidence` 控制。
 * 高风险请求默认拒绝，并发起 Telegram 审批卡片。
 * Inline 按钮：
       * ✅ 仅本次
@@ -179,6 +179,16 @@ ALLOWED_USER_IDS=123456789
 
 该模型支持“逐步放权”。
 
+### Shadow Enforcement（特性开关）
+
+* 默认关闭：`SHADOW_ENFORCEMENT_ENABLED=false` 时，决策/执行路径保持既有逻辑；shadow 审计事件仅作为增量记录。
+* 作用域 `SHADOW_ENFORCEMENT_SCOPE=deny_only`：
+      * 当 shadow 策略为 `deny` 时直接硬阻断（不创建 pending、不执行）。
+* 作用域 `SHADOW_ENFORCEMENT_SCOPE=deny_and_challenge`：
+      * 包含 `deny_only` 的行为；
+      * 当 shadow 策略为 `challenge` 时强制进入审批流程。
+* 若作用域配置无效，会自动回退到 `deny_only`。
+
 
 ## Telegram 命令
 
@@ -187,10 +197,11 @@ ALLOWED_USER_IDS=123456789
 | `/help` | 查看帮助 |
 | `/new` | 开始新的 Copilot 会话 |
 | `/sessions` | 查看最近会话列表 |
-| `/use <id>` | 切换到历史会话 |
-| `/agent` | 查看当前 agent |
-| `/agent <name>` | 设置当前 agent（执行 Copilot 时透传 `--agent <name>`） |
-| `/agent clear` | 清除当前 agent |
+| `/session <id>` | 按 `/sessions` 数字编号切换会话 |
+| `/agents` | 列出可用 agent（数字编号，`1` 为 `none`） |
+| `/agent <id>` | 按数字编号设置当前 agent（执行时透传 `--agent <name>`） |
+| `/models` | 列出可用模型（数字编号，显示倍率 `x0/x1/x3`） |
+| `/model <id>` | 按数字编号设置当前模型（执行时透传 `--model <id>`） |
 
 普通消息自动续接当前会话。
 
@@ -198,6 +209,20 @@ ALLOWED_USER_IDS=123456789
 
 ## 持久化与审计
 
-* `approval_store.json`：保存 grants、pending、用户会话映射、用户 agent 映射。
+* `approval_store.json`：保存 grants、pending、用户 session/agent/model 映射。
 * `audit_log.jsonl`：追加写入审批/执行审计事件。
 * 支持处理 `callback_query`，并正确调用 `answerCallbackQuery`。
+
+### 离线审计分析器（C-Phase4）
+
+可使用仅依赖标准库的脚本离线分析审计质量，并回放不同置信度阈值：
+
+```powershell
+# 基础分析（默认读取 ./audit_log.jsonl，时区 Asia/Shanghai）
+python .\scripts\audit_analyzer.py
+
+# 按时间/用户过滤 + 自定义阈值回放 + 导出 JSON
+python .\scripts\audit_analyzer.py --since 2026-03-09 --until 2026-03-09T23:59:59 --user-id 7212596491 --replay-thresholds 0.6,0.7,0.8,0.9 --json-out .\audit_summary.json
+```
+
+注意：历史记录可能缺少 `plan_first_mode` 等字段；回放会在输出/建议中明确提示所使用的假设。
