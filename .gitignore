@@ -6,3 +6,5 @@ __pycache__/
 *_log.jsonl
 media/
 tmp/
+approval_store.json
+user_sessions.json
