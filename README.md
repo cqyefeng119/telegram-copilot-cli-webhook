@@ -226,3 +226,30 @@ python .\scripts\audit_analyzer.py --since 2026-03-09 --until 2026-03-09T23:59:5
 ```
 
 Caveat: historical records may miss fields such as `plan_first_mode`; replay reports any assumptions explicitly in output/hints.
+
+---
+
+## System Architecture
+
+The system is structured in five layers with strict separation of concerns. `server.py` serves only as an orchestrator; all policy logic is centralized in the `core/` package.
+
+| Layer | Component | Description |
+|---|---|---|
+| Transport | Telegram Bot API | Phone → Bot → Webhook |
+| Reception | `server.py` | Parse Update, build `MessageContext` |
+| Policy | `core/policy_engine.py`<br>`core/approval_flow.py` | Static risk analysis → policy decision → approval gate |
+| Execution | `gh copilot` CLI | Plan + execute with `--resume` session continuity |
+| Audit | `audit_log.jsonl` | Append-only event stream with offline replay analysis |
+
+Core modules:
+
+```
+core/
+├── policy_engine.py    # Pure-function policy decisions (no I/O)
+├── approval_flow.py    # Four-level authorization state machine (dependency injection)
+├── pipeline_context.py # MessageContext dataclass
+├── runtime_state.py    # Configuration / persistence / audit logging
+└── telegram_io.py      # Telegram transport helpers
+```
+
+Detailed architectural reference → [docs/architecture.md](docs/architecture.md)

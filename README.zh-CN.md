@@ -119,6 +119,23 @@ PUBLIC_URL=https://your-domain.example.com
 Quick Tunnel 每次重启 URL 会变化。
 生产环境建议使用固定 Tunnel。
 
+
+---
+## Telegram 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 查看帮助 |
+| `/new` | 开始新的 Copilot 会话 |
+| `/sessions` | 查看最近会话列表 |
+| `/session <id>` | 按 `/sessions` 数字编号切换会话 |
+| `/agents` | 列出可用 agent（数字编号，`1` 为 `none`） |
+| `/agent <id>` | 按数字编号设置当前 agent（执行时透传 `--agent <name>`） |
+| `/models` | 列出可用模型（数字编号，显示倍率 `x0/x1/x3`） |
+| `/model <id>` | 按数字编号设置当前模型（执行时透传 `--model <id>`） |
+
+普通消息自动续接当前会话。
+
 ---
 
 ## 安全配置
@@ -189,22 +206,6 @@ ALLOWED_USER_IDS=123456789
       * 当 shadow 策略为 `challenge` 时强制进入审批流程。
 * 若作用域配置无效，会自动回退到 `deny_only`。
 
-
-## Telegram 命令
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 查看帮助 |
-| `/new` | 开始新的 Copilot 会话 |
-| `/sessions` | 查看最近会话列表 |
-| `/session <id>` | 按 `/sessions` 数字编号切换会话 |
-| `/agents` | 列出可用 agent（数字编号，`1` 为 `none`） |
-| `/agent <id>` | 按数字编号设置当前 agent（执行时透传 `--agent <name>`） |
-| `/models` | 列出可用模型（数字编号，显示倍率 `x0/x1/x3`） |
-| `/model <id>` | 按数字编号设置当前模型（执行时透传 `--model <id>`） |
-
-普通消息自动续接当前会话。
-
 ---
 
 ## 持久化与审计
@@ -225,4 +226,26 @@ python .\scripts\audit_analyzer.py
 python .\scripts\audit_analyzer.py --since 2026-03-09 --until 2026-03-09T23:59:59 --user-id 7212596491 --replay-thresholds 0.6,0.7,0.8,0.9 --json-out .\audit_summary.json
 ```
 
-注意：历史记录可能缺少 `plan_first_mode` 等字段；回放会在输出/建议中明确提示所使用的假设。
+---
+## 系统架构
+
+本系统由五层构成，各层职责严格分离，`server.py` 只负责编排，策略逻辑集中在 `core/` 包内。
+
+| 层 | 组件 | 说明 |
+|---|---|---|
+| 传输层 | Telegram Bot API | 手机 → Bot → Webhook |
+| 接收层 | `server.py` | 解析 Update，构建 `MessageContext` |
+| 策略层 | `core/policy_engine.py`<br>`core/approval_flow.py` | 静态风险分析 → 策略决策 → 授权门控 |
+| 执行层 | `gh copilot` CLI | 规划 + 执行，支持 `--resume` 会话连续性 |
+| 审计层 | `audit_log.jsonl` | Append-only 事件流，支持离线重放分析 |
+
+核心模块：
+
+```
+core/
+├── policy_engine.py    # 纯函数策略决策（无 IO）
+├── approval_flow.py    # 四级授权状态机（依赖注入）
+├── pipeline_context.py # MessageContext dataclass
+├── runtime_state.py    # 配置 / 持久化 / 审计写入
+└── telegram_io.py      # Telegram 传输辅助
+```

@@ -1,18 +1,28 @@
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-import httpx
 import subprocess
 import os
 import shutil
 import re
 import yaml
 import json
-import secrets
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 from urllib.parse import urlparse
+
+from core import approval_flow
+
+from core.policy_engine import _decide_plan_policy, _decide_shadow_enforcement, _recommend_shadow_strategy
+from core.pipeline_context import build_message_context
+from core.telegram_io import (
+    _answer_callback_query,
+    _download_telegram_image,
+    _send_telegram_message,
+    _send_telegram_message_with_keyboard,
+    _send_telegram_photo,
+)
 
 # Prefer loading environment variables from the .env file in the same directory
 load_dotenv()
@@ -123,6 +133,14 @@ def _safe_log(message: str) -> None:
     except UnicodeEncodeError:
         safe_message = message.encode("ascii", errors="backslashreplace").decode("ascii")
         print(safe_message)
+
+
+def _is_playwright_persistent_launch_error(stderr: str) -> bool:
+    normalized = (stderr or "").lower()
+    return (
+        "browsertype.launchpersistentcontext" in normalized
+        and "failed to launch the browser process" in normalized
+    )
 
 
 _USER_SESSION_PERSIST_FILE = Path(__file__).parent / "user_sessions.json"
@@ -559,20 +577,26 @@ def _plan_actions_with_copilot(
     return parsed
 
 
+def _approval_flow_deps() -> approval_flow.ApprovalFlowDeps:
+    return approval_flow.ApprovalFlowDeps(
+        runtime_store=_RUNTIME_STORE,
+        save_store=_save_store,
+        append_audit=_append_audit,
+        answer_callback_query=_answer_callback_query,
+        send_telegram_message=_send_telegram_message,
+        execute_copilot=_execute_copilot,
+        normalize_domain=_normalize_domain,
+        project_scope_key=PROJECT_SCOPE_KEY,
+        allowed_user_ids=ALLOWED_USER_IDS,
+    )
+
+
 def _iter_allow_grants() -> list[dict[str, Any]]:
-    grants = _RUNTIME_STORE.get("grants") or []
-    if not isinstance(grants, list):
-        return []
-    return [g for g in grants if isinstance(g, dict) and g.get("allow") is True]
+    return approval_flow.iter_allow_grants(_RUNTIME_STORE)
 
 
 def _match_grant(grant: dict[str, Any], scope: str, scope_id: str, risk_kind: str) -> bool:
-    if grant.get("scope") != scope:
-        return False
-    if str(grant.get("scope_id") or "") != scope_id:
-        return False
-    grant_risk = str(grant.get("risk") or "")
-    return grant_risk == risk_kind or grant_risk == "*"
+    return approval_flow.match_grant(grant, scope, scope_id, risk_kind)
 
 
 def _build_authorization_scopes(
@@ -580,68 +604,35 @@ def _build_authorization_scopes(
     agent_name: str | None,
     current_session: str | None,
 ) -> tuple[tuple[str, str], ...]:
-    return (
-        ("user", str(user_id)),
-        ("agent", agent_name or ""),
-        ("project", PROJECT_SCOPE_KEY),
-        ("conversation", current_session or "new-session"),
+    return approval_flow.build_authorization_scopes(
+        user_id,
+        agent_name,
+        current_session,
+        PROJECT_SCOPE_KEY,
     )
 
 
 def _resolve_allow_scope(user_id: int, agent_name: str | None, current_session: str | None, risk_kind: str) -> str | None:
-    scopes = _build_authorization_scopes(user_id, agent_name, current_session)
-    grants = _iter_allow_grants()
-    for scope, scope_id in scopes:
-        if not scope_id:
-            continue
-        if any(_match_grant(grant, scope, scope_id, risk_kind) for grant in grants):
-            return scope
-    return None
+    return approval_flow.resolve_allow_scope(
+        user_id,
+        agent_name,
+        current_session,
+        risk_kind,
+        _RUNTIME_STORE,
+        PROJECT_SCOPE_KEY,
+    )
 
 
 def _upsert_allow_grant(scope: str, scope_id: str, risk_kind: str, by_user_id: int) -> None:
-    if not scope_id:
-        return
-    grants = _iter_allow_grants()
-    for grant in grants:
-        if _match_grant(grant, scope, scope_id, risk_kind):
-            return
-    grants.append(
-        {
-            "scope": scope,
-            "scope_id": scope_id,
-            "risk": risk_kind,
-            "allow": True,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "by_user_id": by_user_id,
-        }
-    )
-    _RUNTIME_STORE["grants"] = grants
-    _save_store()
+    approval_flow.upsert_allow_grant(scope, scope_id, risk_kind, by_user_id, _RUNTIME_STORE, _save_store)
 
 
 def _iter_domain_grants() -> list[dict[str, Any]]:
-    grants = _RUNTIME_STORE.get("domain_grants") or []
-    if not isinstance(grants, list):
-        return []
-    return [
-        grant
-        for grant in grants
-        if isinstance(grant, dict) and grant.get("allow") is True and _normalize_domain(str(grant.get("domain") or ""))
-    ]
+    return approval_flow.iter_domain_grants(_RUNTIME_STORE, _normalize_domain)
 
 
 def _match_domain_grant(grant: dict[str, Any], scope: str, scope_id: str, domain: str) -> bool:
-    if grant.get("scope") != scope:
-        return False
-    if str(grant.get("scope_id") or "") != scope_id:
-        return False
-
-    granted_domain = _normalize_domain(str(grant.get("domain") or ""))
-    requested_domain = _normalize_domain(domain)
-    if not granted_domain or not requested_domain:
-        return False
-    return requested_domain == granted_domain or requested_domain.endswith(f".{granted_domain}")
+    return approval_flow.match_domain_grant(grant, scope, scope_id, domain, _normalize_domain)
 
 
 def _resolve_domain_allow_scope(
@@ -650,201 +641,27 @@ def _resolve_domain_allow_scope(
     current_session: str | None,
     domains: list[str],
 ) -> str | None:
-    normalized_domains = [domain for domain in (_normalize_domain(item) for item in domains) if domain]
-    if not normalized_domains:
-        return None
-
-    scopes = _build_authorization_scopes(user_id, agent_name, current_session)
-    grants = _iter_domain_grants()
-
-    for scope, scope_id in scopes:
-        if not scope_id:
-            continue
-        if all(any(_match_domain_grant(grant, scope, scope_id, domain) for grant in grants) for domain in normalized_domains):
-            return scope
-
-    if all(
-        any(
-            _match_domain_grant(grant, scope, scope_id, domain)
-            for scope, scope_id in scopes
-            if scope_id
-            for grant in grants
-        )
-        for domain in normalized_domains
-    ):
-        return "mixed"
-    return None
-
-
-class _PlanPolicyDecision(TypedDict):
-    plan_fail_closed: bool
-    requires_approval: bool
-    effective_risk_kind: str
-    effective_reason: str
-    allow_scope: str | None
-    approval_source: str
-
-
-class _ShadowStrategyRecommendation(TypedDict):
-    strategy: str
-    reason_codes: list[str]
-    confidence: float
-    summary: str
-
-
-def _decide_shadow_enforcement(
-    *,
-    enabled: bool,
-    scope: Literal["deny_only", "deny_and_challenge"],
-    strategy: str,
-) -> Literal["pass", "force_challenge", "force_deny"]:
-    if not enabled:
-        return "pass"
-    if strategy == "deny":
-        return "force_deny"
-    if scope == "deny_and_challenge" and strategy == "challenge":
-        return "force_challenge"
-    return "pass"
-
-
-def _recommend_shadow_strategy(
-    *,
-    plan_fail_closed: bool,
-    has_network_action: bool,
-    unauthorized_domains: list[str],
-    missing_risk_kinds: list[str],
-    planned_action_types: list[str],
-) -> _ShadowStrategyRecommendation:
-    reason_codes: list[str] = []
-
-    if plan_fail_closed:
-        reason_codes.append("plan_fail_closed")
-    if has_network_action and unauthorized_domains:
-        reason_codes.append("unauthorized_domains")
-
-    sensitive_action_types = {"destructive", "repo_write", "secret"}
-    if missing_risk_kinds:
-        reason_codes.append("missing_risk_kinds")
-    if any(action_type in sensitive_action_types for action_type in planned_action_types):
-        reason_codes.append("sensitive_action_type")
-
-    if plan_fail_closed or (has_network_action and bool(unauthorized_domains)):
-        strategy = "deny"
-        confidence = 0.98
-    elif missing_risk_kinds or any(action_type in sensitive_action_types for action_type in planned_action_types):
-        strategy = "challenge"
-        confidence = 0.87
-    else:
-        strategy = "allow"
-        confidence = 0.72
-
-    summary = f"shadow strategy={strategy}; reasons={','.join(reason_codes) if reason_codes else 'none'}"
-    return {
-        "strategy": strategy,
-        "reason_codes": reason_codes,
-        "confidence": confidence,
-        "summary": summary,
-    }
-
-
-def _decide_plan_policy(
-    *,
-    plan_parse_ok: bool,
-    plan_confidence: float,
-    plan_confidence_threshold: float,
-    missing_risk_kinds: list[str],
-    has_network_action: bool,
-    unauthorized_domains: list[str],
-    risk_scopes: dict[str, str | None],
-    network_allow_scope: str | None,
-) -> _PlanPolicyDecision:
-    plan_fail_closed = not plan_parse_ok or plan_confidence < plan_confidence_threshold
-    requires_approval = plan_fail_closed or bool(missing_risk_kinds) or (has_network_action and bool(unauthorized_domains))
-
-    effective_risk_kind = "plan"
-    reason_parts: list[str] = []
-    if plan_fail_closed:
-        if not plan_parse_ok:
-            reason_parts.append("action plan 解析失败（fail-closed）")
-        else:
-            reason_parts.append(f"action plan 置信度过低: {plan_confidence:.2f} < {plan_confidence_threshold:.2f}")
-    if missing_risk_kinds:
-        effective_risk_kind = missing_risk_kinds[0]
-        reason_parts.append(f"高风险动作未授权: {', '.join(missing_risk_kinds)}")
-    if has_network_action and unauthorized_domains:
-        effective_risk_kind = "network"
-        shown_domains = unauthorized_domains
-        domain_text = ", ".join(shown_domains[:5])
-        more = "" if len(shown_domains) <= 5 else f" (+{len(shown_domains) - 5})"
-        reason_parts.append(f"未授权网络域名: {domain_text}{more}" if domain_text else "未授权网络访问")
-    effective_reason = "；".join(reason_parts) if reason_parts else "需审批"
-
-    allow_scope = None
-    if risk_scopes:
-        allow_scope = ",".join(sorted({scope for scope in risk_scopes.values() if scope}))
-
-    approval_source = (
-        f"auto:risk:{allow_scope}"
-        if allow_scope
-        else (f"auto:network:{network_allow_scope}" if network_allow_scope else "auto:low-risk")
+    return approval_flow.resolve_domain_allow_scope(
+        user_id,
+        agent_name,
+        current_session,
+        domains,
+        _RUNTIME_STORE,
+        _normalize_domain,
+        PROJECT_SCOPE_KEY,
     )
-
-    return {
-        "plan_fail_closed": plan_fail_closed,
-        "requires_approval": requires_approval,
-        "effective_risk_kind": effective_risk_kind,
-        "effective_reason": effective_reason,
-        "allow_scope": allow_scope,
-        "approval_source": approval_source,
-    }
 
 
 def _upsert_domain_grant(scope: str, scope_id: str, domain: str, by_user_id: int) -> None:
-    if not scope_id:
-        return
-    normalized = _normalize_domain(domain)
-    if not normalized:
-        return
-
-    grants = _iter_domain_grants()
-    for grant in grants:
-        if _match_domain_grant(grant, scope, scope_id, normalized):
-            return
-
-    grants.append(
-        {
-            "scope": scope,
-            "scope_id": scope_id,
-            "domain": normalized,
-            "allow": True,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "by_user_id": by_user_id,
-        }
-    )
-    _RUNTIME_STORE["domain_grants"] = grants
-    _save_store()
+    approval_flow.upsert_domain_grant(scope, scope_id, domain, by_user_id, _RUNTIME_STORE, _save_store, _normalize_domain)
 
 
 def _create_pending(payload: dict[str, Any]) -> str:
-    pending_id = f"p{datetime.now().strftime('%m%d%H%M%S')}{secrets.token_hex(2)}"
-    pending = _RUNTIME_STORE.get("pending") or {}
-    pending[pending_id] = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        **payload,
-    }
-    _RUNTIME_STORE["pending"] = pending
-    _save_store()
-    return pending_id
+    return approval_flow.create_pending(payload, _RUNTIME_STORE, _save_store)
 
 
 def _pop_pending(pending_id: str) -> dict[str, Any] | None:
-    pending = _RUNTIME_STORE.get("pending") or {}
-    if pending_id not in pending:
-        return None
-    item = pending.pop(pending_id)
-    _RUNTIME_STORE["pending"] = pending
-    _save_store()
-    return item
+    return approval_flow.pop_pending(pending_id, _RUNTIME_STORE, _save_store)
 
 
 def _format_two_stage_receipt(result_text: str, process_detail: str) -> str:
@@ -1029,29 +846,11 @@ def _render_agents(current_agent: str | None) -> str:
     return "\n".join(lines)
 
 
-def _resolve_effective_model(explicit_model: str | None, models: list[dict[str, Any]]) -> tuple[str | None, bool]:
-    available_ids = [str(model.get("id") or "").strip() for model in models]
-    available_ids = [model_id for model_id in available_ids if model_id]
-
-    explicit = (explicit_model or "").strip()
-    if explicit and explicit in available_ids:
-        return explicit, True
-
-    if available_ids:
-        return available_ids[0], False
-
-    return None, False
-
-
 def _render_models(current_model: str | None, models: list[dict[str, Any]]) -> str:
     lines = ["Available models:"]
     for idx, model in enumerate(models, start=1):
         model_id = str(model.get("id") or "")
-        raw_multiplier = model.get("multiplier")
-        try:
-            multiplier = int(raw_multiplier) if raw_multiplier is not None else 1
-        except (TypeError, ValueError):
-            multiplier = 1
+        multiplier = int(model.get("multiplier") or 1)
         selected = current_model == model_id
         marker = " ✅" if selected else ""
         lines.append(f"{idx}. `{model_id}` (x{multiplier}){marker}")
@@ -1081,86 +880,8 @@ def _render_help() -> str:
     )
 
 
-def _split_message(text: str, max_len: int = 3500) -> list[str]:
-    if len(text) <= max_len:
-        return [text]
-
-    chunks = []
-    remaining = text
-    while len(remaining) > max_len:
-        split_at = remaining.rfind("\n", 0, max_len)
-        if split_at <= 0:
-            split_at = max_len
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].strip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-async def _send_telegram_message(chat_id: int, text: str) -> None:
-    if not TELEGRAM_API:
-        return
-
-    chunks = _split_message(text)
-    async with httpx.AsyncClient(timeout=30) as client:
-        for chunk in chunks:
-            payload = {
-                "chat_id": chat_id,
-                "text": chunk,
-            }
-            resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
-            if resp.status_code >= 400:
-                _safe_log(f"[telegram send error] {resp.status_code} {resp.text}")
-
-
-async def _send_telegram_message_with_keyboard(chat_id: int, text: str, inline_keyboard: list[list[dict[str, str]]]) -> None:
-    if not TELEGRAM_API:
-        return
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": {"inline_keyboard": inline_keyboard},
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
-        if resp.status_code >= 400:
-            _safe_log(f"[telegram send keyboard error] {resp.status_code} {resp.text}")
-
-
-async def _answer_callback_query(callback_query_id: str, text: str) -> None:
-    if not TELEGRAM_API:
-        return
-    async with httpx.AsyncClient(timeout=15) as client:
-        payload = {
-            "callback_query_id": callback_query_id,
-            "text": text,
-            "show_alert": False,
-        }
-        resp = await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload)
-        if resp.status_code >= 400:
-            _safe_log(f"[telegram answerCallbackQuery error] {resp.status_code} {resp.text}")
-
-
 def _build_approval_keyboard(pending_id: str, has_agent_scope: bool) -> list[list[dict[str, str]]]:
-    keyboard: list[list[dict[str, str]]] = [
-        [
-            {"text": "✅ 仅本次", "callback_data": f"ap:{pending_id}:once"},
-            {"text": "🔁 本对话允许同类", "callback_data": f"ap:{pending_id}:conversation"},
-        ],
-        [
-            {"text": "📁 本项目允许同类", "callback_data": f"ap:{pending_id}:project"},
-        ],
-    ]
-    if has_agent_scope:
-        keyboard.append([
-            {"text": "🤖 本Agent允许同类", "callback_data": f"ap:{pending_id}:agent"},
-        ])
-    keyboard.append([
-        {"text": "❌ 拒绝", "callback_data": f"ap:{pending_id}:deny"},
-    ])
-    return keyboard
+    return approval_flow.build_approval_keyboard(pending_id, has_agent_scope)
 
 
 def _render_approval_prompt(
@@ -1171,141 +892,18 @@ def _render_approval_prompt(
     domains: list[str] | None = None,
     planned_actions: list[dict[str, Any]] | None = None,
 ) -> str:
-    compact_prompt = (prompt or "").strip().replace("\n", " ")
-    if len(compact_prompt) > 200:
-        compact_prompt = compact_prompt[:200] + "..."
-    domain_summary = ""
-    if domains:
-        shown = ", ".join(domains[:5])
-        extra = "" if len(domains) <= 5 else f" (+{len(domains) - 5})"
-        domain_summary = f"\n域名摘要: {shown}{extra}"
-    action_summary = ""
-    if planned_actions:
-        snippets: list[str] = []
-        for action in planned_actions[:3]:
-            action_type = str(action.get("type") or "other")
-            summary = str(action.get("summary") or "").strip()
-            if summary:
-                snippets.append(f"- {action_type}: {summary}")
-        if snippets:
-            action_summary = "\n动作摘要:\n" + "\n".join(snippets)
-    return (
-        "高风险操作默认拒绝，需审批。\n"
-        f"审批单: {pending_id}\n"
-        f"风险类型: {risk_kind}\n"
-        f"命中规则: {reason}\n"
-        f"{domain_summary}"
-        f"{action_summary}\n"
-        f"请求摘要: {compact_prompt}"
+    return approval_flow.render_approval_prompt(
+        pending_id,
+        risk_kind,
+        reason,
+        prompt,
+        domains,
+        planned_actions,
     )
 
 
 async def _handle_callback_approval(callback_query: dict[str, Any] | None) -> bool:
-    if not callback_query:
-        return False
-
-    callback_id = callback_query.get("id")
-    callback_data = callback_query.get("data") or ""
-    callback_user_id = callback_query.get("from", {}).get("id")
-    callback_chat_id = (callback_query.get("message") or {}).get("chat", {}).get("id")
-
-    if not callback_id:
-        return True
-
-    if ALLOWED_USER_IDS and callback_user_id not in ALLOWED_USER_IDS:
-        await _answer_callback_query(callback_id, "Not allowed")
-        return True
-
-    if not callback_data.startswith("ap:"):
-        await _answer_callback_query(callback_id, "Unknown action")
-        return True
-
-    parts = callback_data.split(":", maxsplit=2)
-    if len(parts) != 3:
-        await _answer_callback_query(callback_id, "Malformed action")
-        return True
-
-    pending_id = parts[1]
-    action = parts[2]
-    valid_actions = {"once", "conversation", "project", "agent", "deny"}
-    if action not in valid_actions:
-        await _answer_callback_query(callback_id, "Unknown action")
-        return True
-
-    pending_map = _RUNTIME_STORE.get("pending") or {}
-    pending = pending_map.get(pending_id)
-    if not pending:
-        await _answer_callback_query(callback_id, "审批单不存在或已处理")
-        return True
-
-    if int(pending.get("user_id", 0) or 0) != int(callback_user_id or 0):
-        await _answer_callback_query(callback_id, "只能由原请求用户审批")
-        return True
-
-    pending_payload = pending
-    risk_kind = str(pending_payload.get("risk_kind") or "general")
-    risk_kinds_raw = pending_payload.get("risk_kinds") or []
-    risk_kinds = [str(item).strip() for item in risk_kinds_raw if str(item).strip()]
-    if not risk_kinds and risk_kind != "general":
-        risk_kinds = [risk_kind]
-    agent_name = pending_payload.get("agent_name")
-    model_id = pending_payload.get("model_id")
-    current_session = pending_payload.get("current_session")
-
-    if action == "deny":
-        _pop_pending(pending_id)
-        await _answer_callback_query(callback_id, "已拒绝（仅本次）")
-        if callback_chat_id:
-            await _send_telegram_message(callback_chat_id, "已拒绝本次高风险操作。")
-        _append_audit("approval_deny_once", {
-            "pending_id": pending_id,
-            "user_id": callback_user_id,
-            "risk_kind": risk_kind,
-            "risk_kinds": risk_kinds,
-        })
-        return True
-
-    if action in {"conversation", "project", "agent"}:
-        if action == "conversation":
-            scope_id = current_session or "new-session"
-        elif action == "project":
-            scope_id = PROJECT_SCOPE_KEY
-        else:
-            if not agent_name:
-                await _answer_callback_query(callback_id, "当前请求无 agent 上下文")
-                return True
-            scope_id = agent_name
-        for item in risk_kinds:
-            _upsert_allow_grant(action, scope_id, item, int(callback_user_id))
-        for domain in pending_payload.get("domains") or []:
-            _upsert_domain_grant(action, scope_id, str(domain), int(callback_user_id))
-        _append_audit("approval_grant", {
-            "pending_id": pending_id,
-            "user_id": callback_user_id,
-            "scope": action,
-            "scope_id": scope_id,
-            "risk_kind": risk_kind,
-            "risk_kinds": risk_kinds,
-            "domains": pending_payload.get("domains") or [],
-        })
-
-    pending_payload = _pop_pending(pending_id)
-    if not pending_payload:
-        await _answer_callback_query(callback_id, "审批单已过期")
-        return True
-
-    await _answer_callback_query(callback_id, "已批准，开始执行")
-    await _execute_copilot(
-        user_id=int(pending_payload["user_id"]),
-        chat_id=int(pending_payload["chat_id"]),
-        copilot_prompt=str(pending_payload["copilot_prompt"]),
-        current_session=current_session,
-        agent_name=agent_name,
-        model_id=model_id,
-        evidence_requested=bool(pending_payload.get("evidence_requested", False)),
-        approval_source=f"callback:{action}",
-    )
-    return True
+    return await approval_flow.handle_callback_approval(callback_query, _approval_flow_deps())
 
 
 async def _handle_command_message(user_id: int, chat_id: int | None, normalized_text: str) -> bool:
@@ -1405,26 +1003,16 @@ async def _handle_command_message(user_id: int, chat_id: int | None, normalized_
                     f"No models discovered from installed Copilot package. ({model_error or 'unknown error'})",
                 )
             else:
-                explicit_model = USER_ACTIVE_MODEL.get(user_id)
-                current_model, _ = _resolve_effective_model(explicit_model, models)
+                current_model = USER_ACTIVE_MODEL.get(user_id)
                 await _send_telegram_message(chat_id, _render_models(current_model, models))
         return True
 
     if normalized_text.startswith("/model"):
         parts = normalized_text.split(maxsplit=1)
         if len(parts) == 1:
+            current_model = USER_ACTIVE_MODEL.get(user_id)
             if chat_id:
-                models, model_error = _discover_models_from_copilot_package()
-                if not models:
-                    await _send_telegram_message(
-                        chat_id,
-                        f"No models discovered from installed Copilot package. ({model_error or 'unknown error'})",
-                    )
-                else:
-                    explicit_model = USER_ACTIVE_MODEL.get(user_id)
-                    current_model, is_explicit = _resolve_effective_model(explicit_model, models)
-                    suffix = "" if is_explicit or not current_model else " (default)"
-                    await _send_telegram_message(chat_id, f"Current model: {current_model or '-'}{suffix}")
+                await _send_telegram_message(chat_id, f"Current model: {current_model or '-'}")
             return True
 
         raw_number = parts[1].strip().lstrip("#")
@@ -1488,11 +1076,12 @@ async def _execute_copilot(
             f"{copilot_prompt}\n\n"
             f"截图证据请保存到目录: {EVIDENCE_SCREENSHOT_DIR}"
         )
-    copilot_args = ["-p", copilot_prompt, "--allow-all-tools"]
+    base_copilot_args = ["-p", copilot_prompt, "--allow-all-tools"]
     if agent_name:
-        copilot_args.extend(["--agent", agent_name])
+        base_copilot_args.extend(["--agent", agent_name])
     if model_id:
-        copilot_args.extend(["--model", model_id])
+        base_copilot_args.extend(["--model", model_id])
+    copilot_args = list(base_copilot_args)
     if current_session:
         copilot_args = ["--resume", current_session] + copilot_args
 
@@ -1539,6 +1128,36 @@ async def _execute_copilot(
 
     stdout = (result.stdout or b"").decode("utf-8", errors="replace").strip()
     stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+
+    if result.returncode != 0 and current_session and _is_playwright_persistent_launch_error(stderr):
+        _safe_log(
+            "[copilot retry] detected Playwright persistent launch error; retrying once without --resume"
+        )
+        _append_audit("execution_retry_fresh_session", {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "approval_source": approval_source,
+            "session": current_session,
+            "agent": agent_name,
+            "model": model_id,
+            "reason": "playwright_launch_persistent_context_failed",
+        })
+        try:
+            retry_result = subprocess.run(
+                copilot_cmd + base_copilot_args,
+                capture_output=True,
+                text=False,
+                env=os.environ.copy(),
+                timeout=COPILOT_TIMEOUT_SECONDS,
+            )
+            retry_stdout = (retry_result.stdout or b"").decode("utf-8", errors="replace").strip()
+            retry_stderr = (retry_result.stderr or b"").decode("utf-8", errors="replace").strip()
+            if retry_result.returncode == 0:
+                result = retry_result
+                stdout = retry_stdout
+                stderr = retry_stderr
+        except Exception as retry_exc:
+            _safe_log(f"[copilot retry] fresh-session retry failed before completion: {retry_exc}")
 
     _safe_log(f"[copilot stdout] {stdout}")
     if result.returncode != 0:
@@ -1625,116 +1244,6 @@ def _find_latest_screenshot(min_mtime: float | None = None) -> Path | None:
     return latest_path
 
 
-async def _send_telegram_photo(chat_id: int, file_path: Path) -> bool:
-    if not TELEGRAM_API or not file_path.exists() or not file_path.is_file():
-        return False
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        with file_path.open("rb") as file_obj:
-            resp = await client.post(
-                f"{TELEGRAM_API}/sendPhoto",
-                data={"chat_id": str(chat_id)},
-                files={"photo": (file_path.name, file_obj, "application/octet-stream")},
-            )
-        if resp.status_code < 400:
-            return True
-
-        _safe_log(f"[telegram sendPhoto error] {resp.status_code} {resp.text}")
-        with file_path.open("rb") as file_obj:
-            fallback_resp = await client.post(
-                f"{TELEGRAM_API}/sendDocument",
-                data={"chat_id": str(chat_id)},
-                files={"document": (file_path.name, file_obj, "application/octet-stream")},
-            )
-        if fallback_resp.status_code < 400:
-            return True
-
-        _safe_log(f"[telegram sendDocument error] {fallback_resp.status_code} {fallback_resp.text}")
-        return False
-
-
-def _extract_telegram_image_candidate(message: dict) -> dict | None:
-    photos = message.get("photo") or []
-    if photos:
-        sorted_photos = sorted(photos, key=lambda item: int(item.get("file_size", 0) or 0))
-        largest = sorted_photos[-1]
-        return {
-            "file_id": largest.get("file_id"),
-            "file_size": int(largest.get("file_size", 0) or 0),
-            "file_name": f"telegram_photo_{largest.get('file_unique_id', 'image')}.jpg",
-        }
-
-    document = message.get("document") or {}
-    if document.get("mime_type", "").startswith("image/"):
-        return {
-            "file_id": document.get("file_id"),
-            "file_size": int(document.get("file_size", 0) or 0),
-            "file_name": document.get("file_name") or f"telegram_document_{document.get('file_unique_id', 'image')}",
-        }
-
-    return None
-
-
-def _sanitize_extension(file_name: str | None, allowed_extensions: set[str], fallback: str = ".jpg") -> str:
-    ext = Path(file_name or "").suffix.lower()
-    if ext in allowed_extensions:
-        return ext
-    return fallback
-
-
-async def _download_telegram_image(user_id: int, message: dict) -> Path | None:
-    if not TELEGRAM_API or not TELEGRAM_FILE_API:
-        return None
-
-    candidate = _extract_telegram_image_candidate(message)
-    if not candidate:
-        return None
-
-    file_id = candidate.get("file_id")
-    if not file_id:
-        return None
-
-    declared_size = int(candidate.get("file_size", 0) or 0)
-    if declared_size > TELEGRAM_IMAGE_MAX_BYTES:
-        _safe_log(f"[telegram image skipped] declared size too large: {declared_size} > {TELEGRAM_IMAGE_MAX_BYTES}")
-        return None
-
-    extension = _sanitize_extension(candidate.get("file_name"), TELEGRAM_IMAGE_EXTENSIONS)
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        get_file_resp = await client.post(f"{TELEGRAM_API}/getFile", json={"file_id": file_id})
-        if get_file_resp.status_code >= 400:
-            _safe_log(f"[telegram getFile error] {get_file_resp.status_code} {get_file_resp.text}")
-            return None
-
-        payload = get_file_resp.json()
-        if not payload.get("ok"):
-            _safe_log(f"[telegram getFile error] unexpected payload: {payload}")
-            return None
-
-        remote_path = (payload.get("result") or {}).get("file_path")
-        if not remote_path:
-            return None
-
-        media_dir = Path(TELEGRAM_MEDIA_DIR) / str(user_id)
-        media_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        local_path = media_dir / f"{timestamp}{extension}"
-
-        download_resp = await client.get(f"{TELEGRAM_FILE_API}/{remote_path}")
-        if download_resp.status_code >= 400:
-            _safe_log(f"[telegram file download error] {download_resp.status_code} {download_resp.text}")
-            return None
-
-        content = download_resp.content
-        if len(content) > TELEGRAM_IMAGE_MAX_BYTES:
-            _safe_log(f"[telegram image skipped] actual size too large: {len(content)} > {TELEGRAM_IMAGE_MAX_BYTES}")
-            return None
-
-        local_path.write_bytes(content)
-        return local_path
-
-
 def create_app() -> FastAPI:
     _app = FastAPI()
 
@@ -1757,17 +1266,17 @@ def create_app() -> FastAPI:
         if not message:
             return {"ok": True}
 
-        user_id = message.get("from", {}).get("id")
-        text = message.get("text") or message.get("caption", "")
+        context = build_message_context(message)
+        user_id = context.user_id
+        text = context.text
 
-        safe_text = text.encode("ascii", errors="backslashreplace").decode("ascii")
-        _safe_log(f"[telegram] message from user_id={user_id} text='{safe_text}'")
+        _safe_log(f"[telegram] message from user_id={user_id} text='{context.safe_text}'")
 
         if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
             return {"ok": True}
 
-        chat_id = message.get("chat", {}).get("id")
-        normalized_text = text.strip()
+        chat_id = context.chat_id
+        normalized_text = context.normalized_text
 
         if await _handle_command_message(user_id, chat_id, normalized_text):
             return {"ok": True}
@@ -1776,7 +1285,7 @@ def create_app() -> FastAPI:
         agent_name = USER_ACTIVE_AGENT.get(user_id)
         model_id = USER_ACTIVE_MODEL.get(user_id)
 
-        local_image_path = await _download_telegram_image(user_id, message)
+        local_image_path = await _download_telegram_image(user_id, context.message)
         copilot_prompt = text
         if local_image_path:
             if copilot_prompt.strip():

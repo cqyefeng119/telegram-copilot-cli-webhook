@@ -212,3 +212,30 @@ ALLOWED_USER_IDS=123456789
 * `approval_store.json`：grants / pending / user session / user agent / user model を保存。
 * `audit_log.jsonl`：承認・実行イベントを JSONL 追記。
 * `callback_query` を処理し、`answerCallbackQuery` を必ず返します。
+
+---
+
+## システムアーキテクチャ
+
+システムは 5 つの層で構成され、各層の職責は厳密に分離されています。`server.py` はオーケストレーターの役割のみを果たし、すべてのポリシーロジックは `core/` パッケージに集中しています。
+
+| 層 | コンポーネント | 説明 |
+|---|---|---|
+| 転送層 | Telegram Bot API | 電話 → Bot → Webhook |
+| 受信層 | `server.py` | Update を解析し `MessageContext` を構築 |
+| ポリシー層 | `core/policy_engine.py`<br>`core/approval_flow.py` | 静的リスク分析 → ポリシー決策 → 承認ゲート |
+| 実行層 | `gh copilot` CLI | `--resume` セッション継続性をサポートする計画 + 実行 |
+| 監査層 | `audit_log.jsonl` | オフライン再生分析をサポートする追記型イベントストリーム |
+
+コアモジュール：
+
+```
+core/
+├── policy_engine.py    # 純粋関数型ポリシー決策（I/O なし）
+├── approval_flow.py    # 4 レベルの認可状態機械（依存性注入）
+├── pipeline_context.py # MessageContext の dataclass
+├── runtime_state.py    # 設定 / 永続化 / 監査ログ
+└── telegram_io.py      # Telegram トランスポートヘルパー
+```
+
+詳細なアーキテクチャリファレンス → [docs/architecture.ja.md](docs/architecture.ja.md)
