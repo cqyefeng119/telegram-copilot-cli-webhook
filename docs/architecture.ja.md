@@ -285,7 +285,6 @@ telegram-copilot-cli-webhook/
 │   └── images/
 ├── README.md
 ├── README.ja.md
-├── README.zh-CN.md
 ├── server.py
 ├── start.ps1
 └── restart.ps1
