@@ -32,7 +32,8 @@ Core principles:
 
 This is not "wire AI into everything" — it establishes an **auditable trust path**.
 
-![Telegram interaction demo](docs/images/telegram-demo.jpg)
+![Telegram interaction demo 1](docs/images/telegram-demo-1.jpg)
+![Telegram interaction demo 2](docs/images/telegram-demo-2.png)
 
 ---
 

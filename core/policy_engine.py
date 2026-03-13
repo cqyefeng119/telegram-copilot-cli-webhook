@@ -90,19 +90,19 @@ def _decide_plan_policy(
     reason_parts: list[str] = []
     if plan_fail_closed:
         if not plan_parse_ok:
-            reason_parts.append("action plan 解析失败（fail-closed）")
+            reason_parts.append("action plan parse failed (fail-closed)")
         else:
-            reason_parts.append(f"action plan 置信度过低: {plan_confidence:.2f} < {plan_confidence_threshold:.2f}")
+            reason_parts.append(f"action plan confidence too low: {plan_confidence:.2f} < {plan_confidence_threshold:.2f}")
     if missing_risk_kinds:
         effective_risk_kind = missing_risk_kinds[0]
-        reason_parts.append(f"高风险动作未授权: {', '.join(missing_risk_kinds)}")
+        reason_parts.append(f"Unauthorized high-risk actions: {', '.join(missing_risk_kinds)}")
     if has_network_action and unauthorized_domains:
         effective_risk_kind = "network"
         shown_domains = unauthorized_domains
         domain_text = ", ".join(shown_domains[:5])
         more = "" if len(shown_domains) <= 5 else f" (+{len(shown_domains) - 5})"
-        reason_parts.append(f"未授权网络域名: {domain_text}{more}" if domain_text else "未授权网络访问")
-    effective_reason = "；".join(reason_parts) if reason_parts else "需审批"
+        reason_parts.append(f"Unauthorized network domains: {domain_text}{more}" if domain_text else "Unauthorized network access")
+    effective_reason = "; ".join(reason_parts) if reason_parts else "Approval required"
 
     allow_scope = None
     if risk_scopes:

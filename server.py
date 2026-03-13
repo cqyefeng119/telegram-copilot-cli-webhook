@@ -665,7 +665,7 @@ def _pop_pending(pending_id: str) -> dict[str, Any] | None:
 
 
 def _format_two_stage_receipt(result_text: str, process_detail: str) -> str:
-    return f"1,结果{result_text}\n2,过程详细{process_detail}"
+    return f"1,Result: {result_text}\n2,Process details: {process_detail}"
 
 
 def _default_screenshot_dirs()-> list[str]:
@@ -1074,7 +1074,7 @@ async def _execute_copilot(
     if evidence_requested:
         copilot_prompt = (
             f"{copilot_prompt}\n\n"
-            f"截图证据请保存到目录: {EVIDENCE_SCREENSHOT_DIR}"
+            f"Save screenshot evidence to: {EVIDENCE_SCREENSHOT_DIR}"
         )
     base_copilot_args = ["-p", copilot_prompt, "--allow-all-tools"]
     if agent_name:
@@ -1099,7 +1099,7 @@ async def _execute_copilot(
             f"status=timeout; timeout={COPILOT_TIMEOUT_SECONDS}s; approval={approval_source}; "
             f"session={current_session or 'new'}; agent={agent_name or '-'}; model={model_id or '-'}"
         )
-        await _send_telegram_message(chat_id, _format_two_stage_receipt("执行超时", detail))
+        await _send_telegram_message(chat_id, _format_two_stage_receipt("Execution timed out", detail))
         _append_audit("execution_timeout", {
             "user_id": user_id,
             "chat_id": chat_id,
@@ -1114,7 +1114,7 @@ async def _execute_copilot(
             f"status=launch_error; approval={approval_source}; session={current_session or 'new'}; "
             f"agent={agent_name or '-'}; model={model_id or '-'}"
         )
-        await _send_telegram_message(chat_id, _format_two_stage_receipt(f"启动失败: {exc}", detail))
+        await _send_telegram_message(chat_id, _format_two_stage_receipt(f"Launch failed: {exc}", detail))
         _append_audit("execution_launch_error", {
             "user_id": user_id,
             "chat_id": chat_id,
@@ -1477,7 +1477,7 @@ def create_app() -> FastAPI:
                     "missing_risk_kinds": missing_risk_kinds,
                 })
                 if chat_id:
-                    await _send_telegram_message(chat_id, "请求已被策略阻止：检测到高风险拒绝条件。")
+                    await _send_telegram_message(chat_id, "Request blocked by policy: high-risk deny condition detected.")
                 return {"ok": True}
 
         if decision["requires_approval"]:

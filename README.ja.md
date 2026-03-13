@@ -32,7 +32,8 @@ localhost:8000（Webhook）
 
 これは「AI をすべてに接続する」ことではなく、**監査可能な信頼パス**を確立するものです。
 
-![Telegram インタラクションデモ](docs/images/telegram-demo.jpg)
+![Telegram インタラクションデモ1](docs/images/telegram-demo-1.jpg)
+![Telegram インタラクションデモ2](docs/images/telegram-demo-2.png)
 
 ---
 

@@ -33,7 +33,8 @@ localhost:8000（Webhook）
 
 这不是“把 AI 接入一切”，而是建立**可审计的信任路径**。
 
-![Telegram 交互实例](docs/images/telegram-demo.jpg)
+![Telegram 交互实例1](docs/images/telegram-demo-1.jpg)
+![Telegram 交互实例2](docs/images/telegram-demo-2.png)
 
 ---
 

@@ -223,19 +223,19 @@ def pop_pending(pending_id: str, runtime_store: dict[str, Any], save_store: Call
 def build_approval_keyboard(pending_id: str, has_agent_scope: bool) -> list[list[dict[str, str]]]:
     keyboard: list[list[dict[str, str]]] = [
         [
-            {"text": "✅ 仅本次", "callback_data": f"ap:{pending_id}:once"},
-            {"text": "🔁 本对话允许同类", "callback_data": f"ap:{pending_id}:conversation"},
+            {"text": "✅ Allow once", "callback_data": f"ap:{pending_id}:once"},
+            {"text": "🔁 Allow similar in conversation", "callback_data": f"ap:{pending_id}:conversation"},
         ],
         [
-            {"text": "📁 本项目允许同类", "callback_data": f"ap:{pending_id}:project"},
+            {"text": "📁 Allow similar in project", "callback_data": f"ap:{pending_id}:project"},
         ],
     ]
     if has_agent_scope:
         keyboard.append([
-            {"text": "🤖 本Agent允许同类", "callback_data": f"ap:{pending_id}:agent"},
+            {"text": "🤖 Allow similar in agent", "callback_data": f"ap:{pending_id}:agent"},
         ])
     keyboard.append([
-        {"text": "❌ 拒绝", "callback_data": f"ap:{pending_id}:deny"},
+        {"text": "❌ Deny", "callback_data": f"ap:{pending_id}:deny"},
     ])
     return keyboard
 
@@ -255,7 +255,7 @@ def render_approval_prompt(
     if domains:
         shown = ", ".join(domains[:5])
         extra = "" if len(domains) <= 5 else f" (+{len(domains) - 5})"
-        domain_summary = f"\n域名摘要: {shown}{extra}"
+        domain_summary = f"\nDomains: {shown}{extra}"
     action_summary = ""
     if planned_actions:
         snippets: list[str] = []
@@ -265,15 +265,15 @@ def render_approval_prompt(
             if summary:
                 snippets.append(f"- {action_type}: {summary}")
         if snippets:
-            action_summary = "\n动作摘要:\n" + "\n".join(snippets)
+            action_summary = "\nPlanned actions:\n" + "\n".join(snippets)
     return (
-        "高风险操作默认拒绝，需审批。\n"
-        f"审批单: {pending_id}\n"
-        f"风险类型: {risk_kind}\n"
-        f"命中规则: {reason}\n"
+        "High-risk operations are denied by default and require approval.\n"
+        f"Approval ID: {pending_id}\n"
+        f"Risk type: {risk_kind}\n"
+        f"Matched rule: {reason}\n"
         f"{domain_summary}"
         f"{action_summary}\n"
-        f"请求摘要: {compact_prompt}"
+        f"Request summary: {compact_prompt}"
     )
 
 
@@ -312,11 +312,11 @@ async def handle_callback_approval(callback_query: dict[str, Any] | None, deps: 
     pending_map = deps.runtime_store.get("pending") or {}
     pending = pending_map.get(pending_id)
     if not pending:
-        await deps.answer_callback_query(callback_id, "审批单不存在或已处理")
+        await deps.answer_callback_query(callback_id, "Approval request not found or already handled")
         return True
 
     if int(pending.get("user_id", 0) or 0) != int(callback_user_id or 0):
-        await deps.answer_callback_query(callback_id, "只能由原请求用户审批")
+        await deps.answer_callback_query(callback_id, "Only the original requester can approve")
         return True
 
     pending_payload = pending
@@ -331,9 +331,9 @@ async def handle_callback_approval(callback_query: dict[str, Any] | None, deps: 
 
     if action == "deny":
         pop_pending(pending_id, deps.runtime_store, deps.save_store)
-        await deps.answer_callback_query(callback_id, "已拒绝（仅本次）")
+        await deps.answer_callback_query(callback_id, "Denied (once)")
         if callback_chat_id:
-            await deps.send_telegram_message(callback_chat_id, "已拒绝本次高风险操作。")
+            await deps.send_telegram_message(callback_chat_id, "This high-risk operation was denied for this run.")
         deps.append_audit("approval_deny_once", {
             "pending_id": pending_id,
             "user_id": callback_user_id,
@@ -350,7 +350,7 @@ async def handle_callback_approval(callback_query: dict[str, Any] | None, deps: 
             scope_id = deps.project_scope_key
         else:
             if not agent_name:
-                await deps.answer_callback_query(callback_id, "当前请求无 agent 上下文")
+                await deps.answer_callback_query(callback_id, "No agent context for this request")
                 return True
             scope_id = agent_name
         for item in risk_kinds:
@@ -378,10 +378,10 @@ async def handle_callback_approval(callback_query: dict[str, Any] | None, deps: 
 
     pending_payload = pop_pending(pending_id, deps.runtime_store, deps.save_store)
     if not pending_payload:
-        await deps.answer_callback_query(callback_id, "审批单已过期")
+        await deps.answer_callback_query(callback_id, "Approval request expired")
         return True
 
-    await deps.answer_callback_query(callback_id, "已批准，开始执行")
+    await deps.answer_callback_query(callback_id, "Approved. Starting execution")
     await deps.execute_copilot(
         user_id=int(pending_payload["user_id"]),
         chat_id=int(pending_payload["chat_id"]),
