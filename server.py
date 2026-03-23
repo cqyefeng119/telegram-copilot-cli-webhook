@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
+import asyncio
 import subprocess
 import os
 import shutil
@@ -9,7 +10,8 @@ import json
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Literal
+import secrets
+from typing import Any, Awaitable, Literal
 from urllib.parse import urlparse
 
 from core import approval_flow
@@ -37,8 +39,10 @@ PROCESSED_UPDATE_ORDER = deque(maxlen=300)
 COPILOT_CONFIG_DIR = os.getenv("COPILOT_CONFIG_DIR") or os.path.join(str(Path.home()), ".copilot")
 SESSION_STATE_DIR = os.path.join(COPILOT_CONFIG_DIR, "session-state")
 COPILOT_TIMEOUT_SECONDS = int(os.getenv("COPILOT_TIMEOUT_SECONDS", "180"))
+COPILOT_EVIDENCE_TIMEOUT_SECONDS = int(os.getenv("COPILOT_EVIDENCE_TIMEOUT_SECONDS", "420"))
 SESSION_LIST_LIMIT = int(os.getenv("SESSION_LIST_LIMIT", "10"))
 PROJECT_SCOPE_KEY = os.getenv("PROJECT_SCOPE_KEY") or Path(os.getcwd()).name
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -214,6 +218,42 @@ def _append_audit(event: str, payload: dict[str, Any]) -> None:
             fp.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         _safe_log(f"[audit] failed to append: {exc}")
+
+
+def _schedule_background_task(
+    coroutine: Awaitable[Any],
+    *,
+    task_name: str,
+    audit_payload: dict[str, Any],
+) -> asyncio.Task[Any]:
+    task = asyncio.create_task(coroutine)
+    _BACKGROUND_TASKS.add(task)
+
+    def _on_done(done_task: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(done_task)
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as callback_exc:
+            _safe_log(f"[background] {task_name} callback failed: {callback_exc}")
+            _append_audit("background_task_error", {
+                "task": task_name,
+                "error": str(callback_exc),
+                **audit_payload,
+            })
+            return
+
+        if exc is not None:
+            _safe_log(f"[background] {task_name} failed: {exc}")
+            _append_audit("background_task_error", {
+                "task": task_name,
+                "error": str(exc),
+                **audit_payload,
+            })
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 _RUNTIME_STORE = _load_store()
@@ -584,7 +624,7 @@ def _approval_flow_deps() -> approval_flow.ApprovalFlowDeps:
         append_audit=_append_audit,
         answer_callback_query=_answer_callback_query,
         send_telegram_message=_send_telegram_message,
-        execute_copilot=_execute_copilot,
+        execute_copilot=_enqueue_execute_copilot,
         normalize_domain=_normalize_domain,
         project_scope_key=PROJECT_SCOPE_KEY,
         allowed_user_ids=ALLOWED_USER_IDS,
@@ -1071,10 +1111,16 @@ async def _execute_copilot(
         return
 
     sessions_before: set[str] = set(_list_sessions(limit=200))
+    started_at = datetime.now().timestamp()
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
     if evidence_requested:
         copilot_prompt = (
             f"{copilot_prompt}\n\n"
-            f"Save screenshot evidence to: {EVIDENCE_SCREENSHOT_DIR}"
+            f"Evidence capture requirements:\n"
+            f"- Save screenshot evidence under: {EVIDENCE_SCREENSHOT_DIR}\n"
+            f"- Use a screenshot filename containing this run_id exactly: {run_id}\n"
+            f"- Close extra blank tabs/popups before taking the final screenshot\n"
+            f"- Verify the active page URL is the expected target and wait until rendered before the final screenshot"
         )
     base_copilot_args = ["-p", copilot_prompt, "--allow-all-tools"]
     if agent_name:
@@ -1084,19 +1130,21 @@ async def _execute_copilot(
     copilot_args = list(base_copilot_args)
     if current_session:
         copilot_args = ["--resume", current_session] + copilot_args
+    execute_timeout_seconds = (
+        COPILOT_EVIDENCE_TIMEOUT_SECONDS if evidence_requested else COPILOT_TIMEOUT_SECONDS
+    )
 
     try:
-        started_at = datetime.now().timestamp()
         result = subprocess.run(
             copilot_cmd + copilot_args,
             capture_output=True,
             text=False,
             env=os.environ.copy(),
-            timeout=COPILOT_TIMEOUT_SECONDS,
+            timeout=execute_timeout_seconds,
         )
     except subprocess.TimeoutExpired:
         detail = (
-            f"status=timeout; timeout={COPILOT_TIMEOUT_SECONDS}s; approval={approval_source}; "
+            f"status=timeout; timeout={execute_timeout_seconds}s; approval={approval_source}; "
             f"session={current_session or 'new'}; agent={agent_name or '-'}; model={model_id or '-'}"
         )
         await _send_telegram_message(chat_id, _format_two_stage_receipt("Execution timed out", detail))
@@ -1108,6 +1156,15 @@ async def _execute_copilot(
             "agent": agent_name,
             "model": model_id,
         })
+        if evidence_requested:
+            try:
+                partial_screenshot = _find_run_bound_evidence_screenshot(run_id=run_id, min_mtime=started_at)
+                if not partial_screenshot:
+                    partial_screenshot = _find_latest_screenshot(min_mtime=started_at)
+                if partial_screenshot:
+                    await _send_telegram_photo(chat_id, partial_screenshot)
+            except Exception as exc:
+                _safe_log(f"[evidence timeout send error] {exc}")
         return
     except Exception as exc:
         detail = (
@@ -1148,7 +1205,7 @@ async def _execute_copilot(
                 capture_output=True,
                 text=False,
                 env=os.environ.copy(),
-                timeout=COPILOT_TIMEOUT_SECONDS,
+                timeout=execute_timeout_seconds,
             )
             retry_stdout = (retry_result.stdout or b"").decode("utf-8", errors="replace").strip()
             retry_stderr = (retry_result.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -1200,7 +1257,9 @@ async def _execute_copilot(
 
     if evidence_requested:
         try:
-            latest_screenshot = _find_latest_screenshot(min_mtime=started_at)
+            latest_screenshot = _find_run_bound_evidence_screenshot(run_id=run_id, min_mtime=started_at)
+            if not latest_screenshot:
+                latest_screenshot = _find_latest_screenshot(min_mtime=started_at)
             if latest_screenshot:
                 sent = await _send_telegram_photo(chat_id, latest_screenshot)
                 if sent:
@@ -1217,29 +1276,92 @@ async def _execute_copilot(
             _safe_log(f"[evidence send error] {exc}")
 
 
+async def _enqueue_execute_copilot(
+    user_id: int,
+    chat_id: int,
+    copilot_prompt: str,
+    current_session: str | None,
+    agent_name: str | None,
+    model_id: str | None,
+    evidence_requested: bool,
+    approval_source: str,
+) -> None:
+    _schedule_background_task(
+        _execute_copilot(
+            user_id=user_id,
+            chat_id=chat_id,
+            copilot_prompt=copilot_prompt,
+            current_session=current_session,
+            agent_name=agent_name,
+            model_id=model_id,
+            evidence_requested=evidence_requested,
+            approval_source=approval_source,
+        ),
+        task_name="execute_copilot",
+        audit_payload={
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "session": current_session,
+            "agent": agent_name,
+            "model": model_id,
+            "approval_source": approval_source,
+        },
+    )
+
+
+def _find_run_bound_evidence_screenshot(run_id: str, min_mtime: float | None = None) -> Path | None:
+    if not run_id:
+        return None
+
+    latest_path: Path | None = None
+    latest_mtime = -1.0
+
+    directory = EVIDENCE_SCREENSHOT_DIR
+    if not directory.exists() or not directory.is_dir():
+        return None
+
+    for item in directory.iterdir():
+        if not item.is_file():
+            continue
+        if item.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+            continue
+        if run_id not in item.name:
+            continue
+        try:
+            mtime = item.stat().st_mtime
+        except OSError:
+            continue
+        if min_mtime is not None and mtime < min_mtime:
+            continue
+        if mtime > latest_mtime:
+            latest_path = item
+            latest_mtime = mtime
+
+    return latest_path
+
+
 def _find_latest_screenshot(min_mtime: float | None = None) -> Path | None:
     latest_path: Path | None = None
     latest_mtime = -1.0
 
-    for raw_dir in SCREENSHOT_DIRS:
-        directory = Path(raw_dir)
-        if not directory.exists() or not directory.is_dir():
-            continue
+    directory = EVIDENCE_SCREENSHOT_DIR
+    if not directory.exists() or not directory.is_dir():
+        return None
 
-        for item in directory.iterdir():
-            if not item.is_file():
-                continue
-            if item.suffix.lower() not in SCREENSHOT_EXTENSIONS:
-                continue
-            try:
-                mtime = item.stat().st_mtime
-            except OSError:
-                continue
-            if min_mtime is not None and mtime < min_mtime:
-                continue
-            if mtime > latest_mtime:
-                latest_path = item
-                latest_mtime = mtime
+    for item in directory.iterdir():
+        if not item.is_file():
+            continue
+        if item.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+            continue
+        try:
+            mtime = item.stat().st_mtime
+        except OSError:
+            continue
+        if min_mtime is not None and mtime < min_mtime:
+            continue
+        if mtime > latest_mtime:
+            latest_path = item
+            latest_mtime = mtime
 
     return latest_path
 
@@ -1530,7 +1652,7 @@ def create_app() -> FastAPI:
         allow_scope = decision["allow_scope"]
 
         if chat_id:
-            await _execute_copilot(
+            await _enqueue_execute_copilot(
                 user_id=user_id,
                 chat_id=chat_id,
                 copilot_prompt=copilot_prompt,
